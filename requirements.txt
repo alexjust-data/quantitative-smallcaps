@@ -1,0 +1,61 @@
+# Data Processing
+polars>=0.20.0
+duckdb>=0.10.0
+pyarrow>=15.0.0
+pandas>=2.1.0
+
+# API & HTTP
+requests>=2.31.0
+urllib3>=2.0.0
+
+# ML & Modeling
+lightgbm>=4.1.0
+xgboost>=2.0.0
+catboost>=1.2.0
+scikit-learn>=1.3.0
+torch>=2.1.0
+transformers>=4.35.0
+
+# Backtesting
+backtrader>=1.9.78
+vectorbt>=0.26.0
+
+# Technical Analysis
+ta-lib>=0.4.28
+pandas-ta>=0.3.14
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+plotly>=5.18.0
+
+# Experiment Tracking
+mlflow>=2.9.0
+
+# Configuration
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Logging
+loguru>=0.7.2
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Type Hints
+mypy>=1.7.0
+
+# Code Quality
+black>=23.11.0
+ruff>=0.1.6
+
+# Jupyter
+jupyter>=1.0.0
+jupyterlab>=4.0.0
+ipykernel>=6.26.0
+
+# Utils
+tqdm>=4.66.0
+python-dateutil>=2.8.2
+pytz>=2023.3

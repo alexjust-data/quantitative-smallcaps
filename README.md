@@ -546,7 +546,7 @@ Polygon.io active tickers may exclude some delistings. Mitigate:
 - [Polygon.io API Docs](https://polygon.io/docs/stocks)
 - [DAS Trader Pro Docs](https://dastrader.com/docs)
 - [Database Architecture](docs/database_architecture.md)
-- [Route Map](docs/rute_map.md)
+- [Route Map](docs/route_map.md)
 
 ### Data Providers
 - Polygon.io: https://polygon.io

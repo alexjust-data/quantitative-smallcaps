@@ -1,0 +1,190 @@
+# Configuration Template - Production Grade
+# Copy to config.yaml and fill with your values
+
+# Polygon.io API
+polygon:
+  api_key: "YOUR_API_KEY_HERE"
+  base_url: "https://api.polygon.io"
+  rate_limit_per_minute: 300  # Conservative, adapter adjusts based on 429/latency
+  timeout: 30
+
+  backoff:
+    strategy: "exponential_jitter"
+    base_seconds: 1
+    max_seconds: 60
+
+# Data Paths
+paths:
+  base_dir: "D:/04_TRADING_SMALLCAPS"
+  raw: "raw"
+  processed: "processed"
+  models: "models"
+  logs: "logs"
+  labels: "labels"
+
+# Universe Definition (Small Caps)
+universe:
+  price_min: 0.50
+  price_max: 20.00
+  market_cap_max: 2_000_000_000  # $2B
+  float_max: 100_000_000  # 100M shares
+  rvol_premarket_min: 2.0
+  gap_pct_min: 10.0
+  volume_premarket_min: 100_000
+
+  # Exchange filters
+  exchanges_allow: ["XNYS", "XNAS", "ARCX"]  # null = all
+  include_delisted: true
+  exclude_etfs: true
+  exclude_adrs: false
+  exclude_otc: true
+
+# Ingestion Settings
+ingestion:
+  batch_size: 50  # Tickers per batch
+  max_retries: 6
+  retry_delay: 2  # seconds
+  page_limit: 50000  # Max records per API request
+
+  # Temporal windows for trades/quotes (prevents huge responses)
+  window_minutes_trades: 15
+  window_minutes_quotes: 15
+
+  # Date ranges
+  daily_bars_years: 5
+  hourly_bars_years: 5
+  minute_bars_years: 3
+  trades_years: 1
+  quotes_years: 1
+
+  # Priority tickers (for trades/quotes)
+  top_volatile_count: 500
+  top_priority_count: 50
+  rank_metrics: ["rvol_5d", "gap_pct_open", "halt_count_30d"]
+
+# Processing Settings
+processing:
+  version: "v1"
+  version_stamp: "2025-01-07"  # Embedded in parquet metadata
+
+  # Timezones (store in UTC, report in ET)
+  timezone_storage: "UTC"
+  timezone_reporting: "America/New_York"
+
+  compression: "zstd"
+  dtype_optimization: true
+
+  # Data Quality Thresholds
+  dq:
+    max_missing_dates_pct: 5.0
+    max_duplicate_rows: 0
+    max_nan_pct: 1.0
+    volume_outlier_std: 5.0
+    price_outlier_std: 5.0
+
+  fail_on_dq_breach: true  # Stop pipeline if DQ thresholds violated
+
+# Feature Engineering
+features:
+  lookback_periods: [5, 10, 20, 50]
+  volume_windows: [1, 5, 15, 30]  # minutes
+  price_windows: [1, 5, 15, 30]  # minutes
+
+# Labeling (Triple Barrier)
+labeling:
+  mode: "percent"  # percent | atr | risk_multiple
+
+  # Percent-based
+  take_profit_pct: 15.0
+  stop_loss_pct: 10.0
+  timeout_minutes: 15
+
+  # ATR-based (if mode=atr)
+  atr_period: 14
+  atr_multiplier_tp: 2.0
+  atr_multiplier_sl: 1.0
+
+  # Risk-multiple based (if mode=risk_multiple)
+  risk_multiple_R: 1.5
+
+  include_costs: true
+
+  # Costs
+  ecn_fee_per_share: 0.003
+  sec_fee_per_dollar: 0.0000278
+
+  # Slippage (dynamic)
+  slippage:
+    spread_factor_normal: 0.5  # 0.5x spread in normal conditions
+    spread_factor_ssr: 2.0  # 2x spread during SSR
+    min_ticks: 1  # Minimum slippage in ticks
+    vol_adj_multiplier: 0.2  # Add 0.2*intraday_sigma to cost
+
+# Model Training
+training:
+  test_size: 0.2
+  validation_size: 0.2
+  random_seed: 42
+
+  # Walk-Forward
+  train_months: 6
+  validation_months: 1
+  test_months: 1
+
+  # Cross-Validation (Purged)
+  n_splits: 5
+  purge_days: 1  # Remove data around validation set
+  embargo_days: 3  # Additional embargo after purge
+
+# Backtesting
+backtesting:
+  initial_capital: 100_000
+  max_position_size_pct: 5.0
+  max_open_positions: 10
+  max_daily_loss: 2000
+
+  trading_hours:
+    start: "09:30"
+    end: "15:45"
+
+  # Order execution model
+  order_model:
+    type: "marketable_limit"  # market | limit | marketable_limit
+    queue_model: "pro_rata"  # simple | pro_rata
+    partial_fills: true
+    cancel_on: "timeout_ms:250"
+
+  # Costs
+  costs:
+    ecn_fee: 0.003
+    sec_fee: 0.0000278
+
+  # Constraints
+  constraints:
+    ssr_active: true  # Model SSR restrictions
+    borrow_fee_bps: 50  # If simulating shorts
+
+# DAS Trader (Execution)
+das:
+  enabled: false
+  api_endpoint: "http://localhost:5000"
+
+  risk:
+    max_daily_loss: 2000
+    max_position_size: 5000
+    max_open_positions: 5
+    kill_switch_time: "15:45"
+
+# Logging
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}"
+  rotation: "10 MB"
+  retention: "30 days"
+
+  # Separate log files by component
+  files:
+    ingestion: "logs/ingestion/polygon_ingestion.log"
+    processing: "logs/processing/data_processing.log"
+    datasets: "logs/processing/dataset_freeze.log"
+    training: "logs/training/model_training.log"
