@@ -22,7 +22,7 @@ vectorbt>=0.26.0
 
 # Technical Analysis
 ta-lib>=0.4.28
-pandas-ta>=0.3.14
+# pandas-ta  # Skip for now (Python 3.13 compatibility issues)
 
 # Visualization
 matplotlib>=3.8.0
