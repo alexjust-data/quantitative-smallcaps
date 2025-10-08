@@ -372,6 +372,114 @@ class PolygonIngester:
             df.write_parquet(out, compression="zstd")
             logger.info(f"Saved {df.height} bars to {out}")
 
+    # ====================== WEEK 4: SHORT INTEREST & VOLUME ======================
+
+    def _fetch_paginated(self, endpoint: str, params: dict) -> list[dict]:
+        """Generic paginator for Polygon endpoints that return next_url."""
+        out, next_url, first = [], None, True
+        cur_endpoint, cur_params = endpoint, dict(params)
+        while True:
+            data = self._make_request(cur_endpoint, cur_params if first else None)
+            first = False
+            if not data or "results" not in data:
+                break
+            out.extend(data["results"])
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            cur_endpoint = next_url
+        return out
+
+    def _save_parquet(self, df: pl.DataFrame, rel_path: Path, kind: str):
+        """Save DataFrame to parquet with logging."""
+        rel_path.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(rel_path, compression="zstd")
+        logger.info(f"Saved {len(df)} {kind} to {rel_path}")
+
+    def download_short_interest(
+        self,
+        from_date: str,
+        to_date: str,
+        symbols: list[str] | None = None,
+    ) -> pl.DataFrame | None:
+        """Download Short Interest (semi-monthly)."""
+        ep = self.config["polygon"]["endpoints"]["short_interest"]
+        logger.info(f"Downloading Short Interest {from_date}→{to_date}")
+
+        params = {"limit": 1000, "from": from_date, "to": to_date}
+        if symbols and len(symbols) == 1:
+            params["ticker"] = symbols[0]
+
+        rows = self._fetch_paginated(ep, params)
+        if not rows:
+            logger.warning("No short interest rows returned")
+            return None
+
+        df = pl.DataFrame(rows)
+
+        # Normalize columns
+        for col in ["ticker", "settlement_date", "publish_date", "short_interest", "short_interest_percent", "float", "outstanding_shares"]:
+            if col not in df.columns:
+                df = df.with_columns(pl.lit(None).alias(col))
+
+        # Convert dates
+        for dcol in ["settlement_date", "publish_date"]:
+            if dcol in df.columns:
+                try:
+                    df = df.with_columns(pl.col(dcol).str.strptime(pl.Date, strict=False))
+                except Exception:
+                    pass
+
+        # Impute publish_date if missing
+        if "publish_date" in df.columns and df["publish_date"].null_count() == df.height:
+            lag = int(self.config["ingestion"]["short_interest_publish_lag_bdays"])
+            df = df.with_columns((pl.col("settlement_date") + pl.duration(days=lag)).alias("publish_date"))
+
+        # Save
+        ts = datetime.utcnow().strftime("%Y%m%d")
+        out = self.raw_dir / "short_interest" / f"short_interest_{from_date}_{to_date}_{ts}.parquet"
+        self._save_parquet(df, out, "short_interest")
+        return df
+
+    def download_short_volume(
+        self,
+        from_date: str,
+        to_date: str,
+        symbols: list[str] | None = None,
+    ) -> pl.DataFrame | None:
+        """Download Short Volume (daily)."""
+        ep = self.config["polygon"]["endpoints"]["short_volume"]
+        logger.info(f"Downloading Short Volume {from_date}→{to_date}")
+
+        params = {"limit": 1000, "from": from_date, "to": to_date}
+        if symbols and len(symbols) == 1:
+            params["ticker"] = symbols[0]
+
+        rows = self._fetch_paginated(ep, params)
+        if not rows:
+            logger.warning("No short volume rows returned")
+            return None
+
+        df = pl.DataFrame(rows)
+
+        # Normalize columns
+        for col in ["ticker", "date", "short_volume", "total_volume", "short_volume_ratio"]:
+            if col not in df.columns:
+                df = df.with_columns(pl.lit(None).alias(col))
+
+        # Convert dates
+        if "date" in df.columns:
+            try:
+                df = df.with_columns(pl.col("date").str.strptime(pl.Date, strict=False))
+            except Exception:
+                pass
+
+        # Save
+        ts = datetime.utcnow().strftime("%Y%m%d")
+        out = self.raw_dir / "short_volume" / f"short_volume_{from_date}_{to_date}_{ts}.parquet"
+        self._save_parquet(df, out, "short_volume")
+        return df
+
 
 def main():
     parser = argparse.ArgumentParser(description="Polygon.io data ingestion")

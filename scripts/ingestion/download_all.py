@@ -97,25 +97,25 @@ class HistoricalDownloader:
         return small_caps
 
     def download_week1_foundation(self):
-        """Week 1: Reference data + daily bars + corporate actions"""
+        """Week 1: Reference data + daily bars + hourly bars + corporate actions"""
         logger.info("=== WEEK 1: Foundation Data ===")
 
         # 1. Universe
-        logger.info("Step 1/4: Downloading ticker universe")
+        logger.info("Step 1/5: Downloading ticker universe")
         self.ingester.download_tickers(active=True)
         self.ingester.download_tickers(active=False)
 
         # 2. Corporate actions
-        logger.info("Step 2/4: Downloading corporate actions")
+        logger.info("Step 2/5: Downloading corporate actions")
         self.ingester.download_corporate_actions("splits")
         self.ingester.download_corporate_actions("dividends")
 
         # 3. Get small caps
-        logger.info("Step 3/4: Filtering small caps universe")
+        logger.info("Step 3/5: Filtering small caps universe")
         small_caps = self.get_small_caps_universe(letters=getattr(self, "_letters", None))
 
         # 4. Download 5 years daily for all small caps
-        logger.info(f"Step 4/4: Downloading 5 years daily bars for {len(small_caps)} tickers")
+        logger.info(f"Step 4/5: Downloading 5 years daily bars for {len(small_caps)} tickers")
         years = self.config["ingestion"]["daily_bars_years"]
         to_date = datetime.utcnow().strftime("%Y-%m-%d")
         from_date = (datetime.utcnow() - timedelta(days=years*365)).strftime("%Y-%m-%d")
@@ -148,12 +148,53 @@ class HistoricalDownloader:
             time.sleep(0.2)
 
         if failed:
-            failed_file = self.ingester.base_dir / "logs" / f"failed_week1_{datetime.utcnow().strftime('%Y%m%d')}.txt"
+            failed_file = self.ingester.base_dir / "logs" / f"failed_week1_daily_{datetime.utcnow().strftime('%Y%m%d')}.txt"
             failed_file.parent.mkdir(exist_ok=True)
             failed_file.write_text("\n".join(failed))
-            logger.warning(f"Failed tickers ({len(failed)}): saved to {failed_file}")
+            logger.warning(f"Failed daily tickers ({len(failed)}): saved to {failed_file}")
 
-        logger.info(f"=== Week 1 complete: {len(small_caps) - skipped - len(failed)} downloaded, {skipped} skipped, {len(failed)} failed ===")
+        logger.info(f"=== Step 4/5 complete: {len(small_caps) - skipped - len(failed)} daily downloaded, {skipped} skipped, {len(failed)} failed ===")
+
+        # 5. Download 5 years hourly for all small caps
+        logger.info(f"Step 5/5: Downloading 5 years hourly bars for {len(small_caps)} tickers")
+        years = self.config["ingestion"].get("hourly_bars_years", self.config["ingestion"]["daily_bars_years"])
+        to_date = datetime.utcnow().strftime("%Y-%m-%d")
+        from_date = (datetime.utcnow() - timedelta(days=years*365)).strftime("%Y-%m-%d")
+
+        failed_hourly = []
+        skipped_hourly = 0
+        for i, row in enumerate(small_caps.iter_rows(named=True)):
+            ticker = row["ticker"]
+            if (i + 1) % 100 == 0:
+                logger.info(f"Hourly progress: {i+1}/{len(small_caps)} tickers (skipped: {skipped_hourly}, failed: {len(failed_hourly)})")
+
+            # Check if already downloaded (resume capability)
+            out = self.ingester.raw_dir / "market_data" / "bars" / "1h" / f"{ticker}.parquet"
+            if out.exists():
+                skipped_hourly += 1
+                continue
+
+            try:
+                # Use windowing for long ranges (90 day windows for hourly data)
+                for f_date, t_date in self._date_windows(from_date, to_date, window_days=90):
+                    logger.debug(f"{ticker} hourly: {f_date} -> {t_date}")
+                    df = self.ingester.download_aggregates(ticker, 1, "hour", f_date, t_date)
+                    if df is not None and df.height > 0:
+                        self.ingester.save_aggregates(df, "1h", partition_by_date=False)
+            except Exception as e:
+                logger.error(f"Failed hourly {ticker}: {e}")
+                failed_hourly.append(ticker)
+
+            # Rate limiting breather
+            time.sleep(0.2)
+
+        if failed_hourly:
+            failed_file = self.ingester.base_dir / "logs" / f"failed_week1_hourly_{datetime.utcnow().strftime('%Y%m%d')}.txt"
+            failed_file.parent.mkdir(exist_ok=True)
+            failed_file.write_text("\n".join(failed_hourly))
+            logger.warning(f"Failed hourly tickers ({len(failed_hourly)}): saved to {failed_file}")
+
+        logger.info(f"=== Week 1 complete: Daily({len(small_caps) - skipped - len(failed)}) + Hourly({len(small_caps) - skipped_hourly - len(failed_hourly)}) downloaded ===")
 
     def download_week2_3_intraday(self, top_n: int = 500):
         """Week 2-3: 1-min bars for top volatile tickers"""
@@ -200,18 +241,35 @@ class HistoricalDownloader:
         logger.info(f"=== Week 2-3 complete: {len(top_tickers) - len(failed)} downloaded, {len(failed)} failed ===")
 
     def download_week4_complementary(self):
-        """Week 4: Fundamentals, news (optional: trades/quotes)"""
-        logger.info("=== WEEK 4: Complementary Data ===")
+        """Week 4: Short Interest & Short Volume"""
+        logger.info("=== WEEK 4: Short Interest & Short Volume ===")
 
-        logger.info("Week 4 requires additional endpoint implementations")
-        logger.info("- Fundamentals: /vX/reference/financials (income, balance, cashflow)")
-        logger.info("- News: /v2/reference/news")
-        logger.info("- Trades/Quotes: For top 50 tickers only")
+        # Short Interest (semi-monthly, 5 years)
+        si_years = int(self.config["ingestion"]["short_interest_years"])
+        to_date = datetime.utcnow().strftime("%Y-%m-%d")
+        from_si = (datetime.utcnow() - timedelta(days=si_years * 365)).strftime("%Y-%m-%d")
 
-        # TODO: Implement these endpoints in ingest_polygon.py
-        # For now, Week 4 is a placeholder
+        logger.info(f"Downloading Short Interest: {from_si} → {to_date}")
+        try:
+            df_si = self.ingester.download_short_interest(from_si, to_date)
+            if df_si is not None:
+                logger.info(f"Short Interest downloaded: {len(df_si)} records")
+        except Exception as e:
+            logger.error(f"Short Interest failed: {e}")
 
-        logger.info("=== Week 4 skipped (not yet implemented) ===")
+        # Short Volume (daily, 3 years)
+        sv_years = int(self.config["ingestion"]["short_volume_years"])
+        from_sv = (datetime.utcnow() - timedelta(days=sv_years * 365)).strftime("%Y-%m-%d")
+
+        logger.info(f"Downloading Short Volume: {from_sv} → {to_date}")
+        try:
+            df_sv = self.ingester.download_short_volume(from_sv, to_date)
+            if df_sv is not None:
+                logger.info(f"Short Volume downloaded: {len(df_sv)} records")
+        except Exception as e:
+            logger.error(f"Short Volume failed: {e}")
+
+        logger.info("=== Week 4 complete ===")
 
     def run_full_plan(self, weeks: list = [1, 2, 3, 4]):
         """Execute complete month 1 plan"""
