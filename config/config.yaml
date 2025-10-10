@@ -78,9 +78,62 @@ processing:
   # Timezones (store in UTC, report in ET)
   timezone_storage: "UTC"
   timezone_reporting: "America/New_York"
+  timezone: "America/New_York"  # For event window processing
 
   compression: "zstd"
   dtype_optimization: true
+
+  # Event Detection (Multi-Branch Logic - 5 branches)
+  events:
+    # === BRANCH 1: Gap Play ===
+    gap_pct_threshold: 5.0
+    rvol_threshold: 2.0
+
+    # === BRANCH 2: Intraday Range Explosion (IRE) ===
+    ire_pct_threshold: 30.0      # (High-Low)/Open >= 30%
+
+    # === BRANCH 3: Volume Spike Without Gap (VSWG) ===
+    rvol_vswg_threshold: 5.0     # RVOL >= 5x
+    gap_vswg_min: 2.0            # Min gap for VSWG branch
+
+    # === BRANCH 4: ATR Breakout ===
+    rvol_threshold_alt: 1.8
+    atr_pct_window_days: 21
+    atr_pct_percentile: 88       # ATR% >= p88
+
+    # === BRANCH 5: Flush Reversal ===
+    rvol_flush_threshold: 2.5
+    drawdown_flush_threshold: 20.0  # -20% from 5d low
+
+    # === GLOBAL FILTERS ===
+    min_dollar_volume_event: 600000   # $600k minimum
+    bullish_only: true                 # Only green candles (Close > Open)
+    min_trading_days: 120
+
+    # Premarket gate DESHABILITADO (elimina 97% eventos válidos)
+    # Usar PM volume como FEATURE en Stage 2, no como gate en Stage 1
+    use_hourly_premarket_filter: false
+    premarket_hours_ny: [7, 8]
+    premarket_min_dollar_volume: 50000
+
+    # IMPORTANTE: evitar falsos gaps por SPLITS
+    adjusted_prices_for_detection: true
+
+    # Active-day masking (for training)
+    active_day_filters:
+      min_rvol_day: 1.5
+      min_dollar_vol_day: 1000000
+      min_minutes_with_trades_pct: 0.7
+
+  # Event Windows (D-2 to D+2 for swing)
+  events_windows:
+    preset: "compact"
+    compact:
+      d_minus_2: [["09:30","16:00"]]
+      d_minus_1: [["09:30","10:30"], ["14:00","16:00"]]  # +open momentum
+      d:         [["07:00","16:00"]]                      # premarket critical
+      d_plus_1:  [["09:30","12:30"]]                      # extended for mean revert
+      d_plus_2:  [["09:30","12:30"]]
 
   # Data Quality Thresholds
   dq:

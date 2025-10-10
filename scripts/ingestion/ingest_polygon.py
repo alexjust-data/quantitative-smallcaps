@@ -246,10 +246,15 @@ class PolygonIngester:
         timespan: str,
         from_date: str,
         to_date: str,
+        adjusted: bool = True,
     ) -> Optional[pl.DataFrame]:
-        """Download aggregate bars with pagination."""
+        """Download aggregate bars with pagination.
+
+        Args:
+            adjusted: If True, download split-adjusted prices. If False, download raw prices.
+        """
         endpoint = f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
-        params = {"adjusted": "true", "sort": "asc", "limit": self.config["ingestion"]["page_limit"]}
+        params = {"adjusted": str(adjusted).lower(), "sort": "asc", "limit": self.config["ingestion"]["page_limit"]}
 
         logger.info(f"Downloading {timespan} bars for {ticker}: {from_date} -> {to_date}")
 
@@ -343,15 +348,24 @@ class PolygonIngester:
 
         return True
 
-    def save_aggregates(self, df: pl.DataFrame, timespan: str, partition_by_date: bool = True):
-        """Save aggregates to partitioned parquet"""
+    def save_aggregates(self, df: pl.DataFrame, timespan: str, partition_by_date: bool = True, adjusted: bool = True):
+        """Save aggregates to partitioned parquet
+
+        Args:
+            df: DataFrame with aggregates
+            timespan: e.g., '1d', '1m'
+            partition_by_date: If True, partition by symbol/date
+            adjusted: If True, save to bars/{timespan}/. If False, save to bars/{timespan}_raw/
+        """
         if df is None or df.height == 0:
             return
         if not self._dq_check_aggregates(df):
             logger.error("Aborting save due to DQ failure")
             return
 
-        base_path = self.raw_dir / "market_data" / "bars" / str(timespan).lower()
+        # Choose path based on adjustment type
+        suffix = str(timespan).lower() if adjusted else f"{str(timespan).lower()}_raw"
+        base_path = self.raw_dir / "market_data" / "bars" / suffix
         base_path.mkdir(parents=True, exist_ok=True)
 
         # (3) Ensure sorted before persist
