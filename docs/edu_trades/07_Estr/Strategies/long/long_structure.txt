@@ -1,0 +1,71 @@
+- long_full
+  - long
+    - VWAP Reclaim
+      - ApplicationFrameHost_0fkL5FR1C3.png
+      - ApplicationFrameHost_4uqFRCDqcy.png
+      - ApplicationFrameHost_AJWpiUlxQI.png
+      - ApplicationFrameHost_CMWTfRTDs4.png
+      - ApplicationFrameHost_JHD09aoL5y.png
+      - ApplicationFrameHost_KR1ywRd9bS.png
+      - ApplicationFrameHost_QBF5a23EU3.png
+      - ApplicationFrameHost_TQBlJWS4ss.png
+      - ApplicationFrameHost_bVQ8Me4iFP.png
+      - ApplicationFrameHost_ffD7NwXMJZ.png
+      - ApplicationFrameHost_mxvQECOPFe.png
+      - ApplicationFrameHost_qO2nohIbUt.png
+      - ApplicationFrameHost_yBQcPyirKH.png
+      - ApplicationFrameHost_zQ0oP8B574.png
+    - Breakout
+      - ApplicationFrameHost_03SiBrLzZZ.png
+      - ApplicationFrameHost_0AyLUXyeKj.png
+      - ApplicationFrameHost_3FPMhDb8gT.png
+      - ApplicationFrameHost_4958NBI4Bk.png
+      - ApplicationFrameHost_6xA5J6S2al.png
+      - ApplicationFrameHost_HXqgaQ6drG.png
+      - ApplicationFrameHost_ObjnAMuuTf.png
+      - ApplicationFrameHost_YRzX03sEQc.png
+      - ApplicationFrameHost_ajaMJ1v7A5.png
+      - ApplicationFrameHost_fXcs2V9MtG.png
+      - ApplicationFrameHost_jmpNR6iaNB.png
+      - ApplicationFrameHost_mH4jFYujfx.jpg
+    - Dip Buying Panics
+      - ApplicationFrameHost_31mFbWBhT8.png
+      - ApplicationFrameHost_9aXfvrjPs3.png
+      - ApplicationFrameHost_JSTNUDWLEk.png
+      - ApplicationFrameHost_QMgmU0Rs9S.png
+      - ApplicationFrameHost_bRJcc80sjv.png
+      - ApplicationFrameHost_baE3qHE3L6.png
+      - ApplicationFrameHost_qkNRqFbY5t.png
+      - ApplicationFrameHost_qnNbtASJSP.png
+    - PM High
+      - ApplicationFrameHost_GgIeOn4v60.png
+      - ApplicationFrameHost_M6oASnQmHj.png
+      - ApplicationFrameHost_QxQOasnnnk.png
+    - Red to green
+      - ApplicationFrameHost_0TqKtxsVsn.png
+      - ApplicationFrameHost_1vHIEsDbt6.png
+      - ApplicationFrameHost_9CD8lBM5CI.png
+      - ApplicationFrameHost_QnBKStWFPP.png
+      - ApplicationFrameHost_ZeYGxdiUku.png
+      - ApplicationFrameHost_aT57mvYqSc.png
+      - ApplicationFrameHost_bpo0JxWirm.png
+      - ApplicationFrameHost_ed7SFt6DZg.png
+      - ApplicationFrameHost_uDDdBqIXt8.png
+    - swin 1er dia verde
+      - ApplicationFrameHost_31mFbWBhT8.png
+      - ApplicationFrameHost_9aXfvrjPs3.png
+      - ApplicationFrameHost_BXB3hPaB9x.png
+      - ApplicationFrameHost_GyhfczWcnD.png
+      - ApplicationFrameHost_JSTNUDWLEk.png
+      - ApplicationFrameHost_KhevFHqHXr.png
+      - ApplicationFrameHost_LCPzvbGArk.png
+      - ApplicationFrameHost_QMgmU0Rs9S.png
+      - ApplicationFrameHost_bRJcc80sjv.png
+      - ApplicationFrameHost_baE3qHE3L6.png
+      - ApplicationFrameHost_gndh27eIu4.png
+      - ApplicationFrameHost_lfTqos3pg3.png
+      - ApplicationFrameHost_oPVYfSzHND.png
+      - ApplicationFrameHost_qkNRqFbY5t.png
+      - ApplicationFrameHost_qnNbtASJSP.png
+    - Sympathy Plays
+      - ApplicationFrameHost_IadKMgyHZl.png

@@ -1,0 +1,146 @@
+# Liquidity Filters Configuration
+# Umbrales parametrizables para validación de liquidez y ejecutabilidad
+
+# === Nivel 1: Event Detection Filters ===
+event_detection:
+  # Dollar Volume mínimos por sesión (USD)
+  min_dollar_volume:
+    premarket: 300000        # $300k/min en premarket
+    postmarket: 300000       # $300k/min en postmarket
+    rth: 1000000            # $1M/min en regular hours
+    rth_low_price: 2000000  # $2M/min si precio < $2 (penny stocks)
+
+  # Spread Proxy (basado en high-low range)
+  spread_proxy:
+    window_minutes: 10           # Ventana móvil para cálculo
+    percentile_winsor: 95        # Percentil para winsorización
+    max_spread_pct: 0.06         # 6% spread máximo (p95)
+    zscore_method: "robust_mad"  # Método: robust_mad, standard, median
+
+  # Wick Detection (body vs full range)
+  wick_detection:
+    min_body_ratio: 0.5          # |close-open|/(high-low) mínimo
+    # Si body_ratio < 0.5 y spread_proxy alto → marcar como "wicky"
+
+  # Relative Volume (RVOL)
+  rvol:
+    daily_lookback_days: 20      # Días para avg_volume baseline (daily)
+    intraday_lookback_days: 60   # Días para estacionalidad intradía
+    min_rvol_threshold: 2.0      # RVOL mínimo para considerar evento
+
+  # Continuidad temporal (% de minutos con actividad)
+  continuity:
+    window_minutes: 60           # Ventana de análisis (1 hora)
+    min_active_ratio: 0.70       # 70% de minutos con volumen > 0
+
+  # Filtros por precio
+  price_range:
+    min_price: 0.50              # Precio mínimo ($0.50)
+    max_price: 50.0              # Precio máximo ($50)
+    low_price_threshold: 2.0     # Umbral para penny stocks
+
+  # Short Sale Restriction (SSR)
+  ssr:
+    trigger_drop_pct: 10.0       # Caída de -10% vs cierre previo
+    apply_next_day: true         # SSR vigente resto del día + día siguiente
+    only_rth_trigger: true       # Solo disparar SSR si -10% ocurre en RTH
+
+# === Nivel 2: Feature Engineering ===
+features:
+  # Dollar Volume Z-Score (estacionalidad intradía)
+  dollar_volume_zscore:
+    lookback_days: 60            # Días para baseline por minuto-del-día
+    winsorize_percentiles: [1, 99]  # Percentiles para winsorización
+    zscore_method: "robust_mad"
+
+  # Volatility-Adjusted Spread
+  volatility_adjusted_spread:
+    atr_periods: 5               # ATR de 5 minutos
+    anomaly_threshold: 1.5       # spread_vol_adj > 1.5 → spread anómalo
+
+  # Size vs Flow (fricción por tamaño de posición)
+  size_vs_flow:
+    flow_multiplier: 10          # position_usd / (k * dollar_volume)
+    high_friction_threshold: 0.05  # > 5% del flow 10x → alta fricción
+
+  # Imbalance Proxy (presión direccional)
+  imbalance:
+    # (close-open)/(high-low) ∈ [-1, 1]
+    # +1: toda compradora, -1: toda vendedora
+    enabled: true
+
+# === Nivel 3: Backtest Execution & Slippage ===
+execution:
+  # Base Slippage por rango de precio
+  base_slippage:
+    price_lt_2: 0.0075           # 0.75% para precio < $2
+    price_2_to_10: 0.0050        # 0.50% para $2-$10
+    price_gt_10: 0.0035          # 0.35% para > $10
+
+  # Slippage adicional por spread
+  spread_slippage:
+    threshold_pct: 0.01          # Spread base antes de penalizar
+    multiplier: 0.6              # max(0, spread_est - 1%) * 0.6
+
+  # Slippage por tamaño relativo
+  size_slippage:
+    threshold_ratio: 0.01        # position_usd / dollar_volume
+    multiplier: 0.10             # size_ratio * 0.1
+
+  # Partial Fill Limits
+  partial_fill:
+    max_fill_ratio: 1.0          # 100% fill si volumen suficiente
+    min_flow_multiplier: 10      # Mínimo: dollar_volume / position_usd > 10x
+
+  # Slippage adicional por contexto
+  context_slippage:
+    opening_range_minutes: 5     # 09:30-09:35
+    opening_slippage_add: 0.004  # +0.4% en apertura
+    halt_window_minutes: 15      # ±15min de halt
+    halt_slippage_add: 0.010     # +1.0% cerca de halt
+    halt_max_fill_ratio: 0.25    # Max 25% fill cerca de halt
+    ssr_short_slippage_mult: 2.0 # 2x slippage para shorts en SSR
+
+  # Llenado escalonado (multiple minutes)
+  staged_fill:
+    enabled: true
+    trigger_ratio: 0.01          # Si position_usd / dollar_volume > 1%
+    num_stages: 3                # Dividir entrada en 3 minutos
+    max_fill_per_stage: 0.20     # Max 20% del dollar_volume por minuto
+
+# === Nivel 4: Top Events para L2 Data ===
+top_events_l2:
+  # Criterios para descargar /trades y /quotes
+  selection:
+    liquidity_score_quantile: 0.90   # Top 10% por liquidez
+    rvol_quantile: 0.90              # Top 10% por RVOL
+    min_daily_dollar_volume: 5000000 # $5M/día mínimo
+    max_events_per_month: 200        # Límite mensual
+
+  # Ventana de descarga alrededor del evento
+  window:
+    pre_event_minutes: 15        # -15 min antes
+    post_event_minutes: 45       # +45 min después
+
+  # Métricas adicionales si hay quotes
+  quotes_metrics:
+    nbbo_spread: true            # Spread bid/ask real
+    cross_rates: true            # Tasas de cruces
+    uptick_downtick_ratio: true  # Ratio up/down ticks
+    burstiness_poisson: true     # Cola de Poisson (algo-driven)
+
+# === Configuración General ===
+general:
+  # Sessions (tiempos en ET/NYSE)
+  sessions:
+    premarket_start: "04:00"
+    premarket_end: "09:30"
+    rth_start: "09:30"
+    rth_end: "16:00"
+    postmarket_start: "16:00"
+    postmarket_end: "20:00"
+
+  # Logging
+  log_rejected_events: true
+  log_liquidity_warnings: true
+  save_diagnostics: true         # Guardar CSVs de diagnóstico
