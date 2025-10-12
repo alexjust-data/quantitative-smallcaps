@@ -36,7 +36,7 @@ class IntradayEventDetector:
         if config_path is None:
             config_path = PROJECT_ROOT / "config" / "config.yaml"
 
-        with open(config_path) as f:
+        with open(config_path, encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
 
         self.cfg = self.config["processing"]["intraday_events"]
