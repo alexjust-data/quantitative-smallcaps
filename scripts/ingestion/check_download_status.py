@@ -75,11 +75,99 @@ def check_stage(stage_name: str, path: Path, pattern: str = "*.parquet",
     }
 
 
+def check_event_windows():
+    """Check status of event_windows downloads (FASE 3.2 - trades/quotes)"""
+    event_windows_dir = PROJECT_ROOT / "raw" / "market_data" / "event_windows"
+
+    if not event_windows_dir.exists():
+        print(f"⚠️  Event windows directory not found: {event_windows_dir}")
+        return
+
+    # Find all event files
+    all_files = list(event_windows_dir.glob("**/*.parquet"))
+
+    if not all_files:
+        print("⚠️  No event window files found")
+        return
+
+    # Parse files
+    trades_files = [f for f in all_files if "_trades.parquet" in f.name]
+    quotes_files = [f for f in all_files if "_quotes.parquet" in f.name]
+
+    # Group by event (symbol + date_time prefix)
+    events_trades = set()
+    events_quotes = set()
+
+    for f in trades_files:
+        symbol = f.parent.name
+        event_key = f.stem.replace("_trades", "")
+        events_trades.add(f"{symbol}_{event_key}")
+
+    for f in quotes_files:
+        symbol = f.parent.name
+        event_key = f.stem.replace("_quotes", "")
+        events_quotes.add(f"{symbol}_{event_key}")
+
+    all_events = events_trades | events_quotes
+
+    # Calculate storage
+    total_size = sum(f.stat().st_size for f in all_files)
+    trades_size = sum(f.stat().st_size for f in trades_files)
+    quotes_size = sum(f.stat().st_size for f in quotes_files)
+
+    # Print summary
+    print("=" * 70)
+    print("EVENT WINDOWS DOWNLOAD STATUS (FASE 3.2)")
+    print("=" * 70)
+    print(f"Total events: {len(all_events):,}")
+    print(f"  - With trades: {len(events_trades):,}")
+    print(f"  - With quotes: {len(events_quotes):,}")
+    print(f"  - Complete (trades + quotes): {len(events_trades & events_quotes):,}")
+    print(f"  - Incomplete: {len(all_events - (events_trades & events_quotes)):,}")
+
+    print(f"\nStorage:")
+    print(f"  - Total: {human_size(total_size)}")
+    print(f"  - Trades: {human_size(trades_size)}")
+    print(f"  - Quotes: {human_size(quotes_size)}")
+
+    # Symbols coverage
+    symbols_trades = set(f.parent.name for f in trades_files)
+    symbols_quotes = set(f.parent.name for f in quotes_files)
+    all_symbols = symbols_trades | symbols_quotes
+
+    print(f"\nSymbols: {len(all_symbols):,}")
+    for symbol in sorted(all_symbols):
+        symbol_trades = len([e for e in events_trades if e.startswith(f"{symbol}_")])
+        symbol_quotes = len([e for e in events_quotes if e.startswith(f"{symbol}_")])
+        symbol_complete = len([e for e in (events_trades & events_quotes) if e.startswith(f"{symbol}_")])
+        print(f"  {symbol:<10} trades: {symbol_trades:>3}  quotes: {symbol_quotes:>3}  complete: {symbol_complete:>3}")
+
+    # Find incomplete events
+    incomplete = all_events - (events_trades & events_quotes)
+    if incomplete:
+        print(f"\n⚠️  Incomplete events ({len(incomplete)}):")
+        for event in sorted(list(incomplete)[:10]):  # Show first 10
+            has_trades = event in events_trades
+            has_quotes = event in events_quotes
+            status = "trades only" if has_trades else "quotes only"
+            print(f"  {event:<40} {status}")
+        if len(incomplete) > 10:
+            print(f"  ... and {len(incomplete) - 10} more")
+
+    print("=" * 70)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check download progress")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed information")
     parser.add_argument("--expected-tickers", type=int, default=5005, help="Expected small caps count")
+    parser.add_argument("--event-windows", action="store_true", help="Check event windows (FASE 3.2) status")
     args = parser.parse_args()
+
+    # Special mode: event windows only
+    if args.event_windows:
+        check_event_windows()
+        return
 
     print("=" * 70)
     print("DOWNLOAD STATUS REPORT")

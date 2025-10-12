@@ -494,6 +494,166 @@ class PolygonIngester:
         self._save_parquet(df, out, "short_volume")
         return df
 
+    # ====================== REFERENCE EXTRAS ======================
+
+    def download_exchanges(self) -> pl.DataFrame:
+        """
+        /v3/reference/exchanges (confirmed working)
+        """
+        logger.info("Downloading exchanges reference...")
+        endpoint = "/v3/reference/exchanges"
+        params = {"asset_class": "stocks", "limit": 1000}
+        results = []
+        next_url = None
+
+        while True:
+            data = self._make_request(next_url if next_url else endpoint, params if not next_url else None)
+            if not data or "results" not in data:
+                break
+            results.extend(data["results"])
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+
+        if not results:
+            logger.warning("No exchanges found")
+            return pl.DataFrame()
+
+        df = pl.DataFrame(results)
+        out = self.raw_dir / "reference" / "exchanges.parquet"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out, compression="zstd")
+        logger.info(f"Saved {len(df)} exchanges to {out}")
+        return df
+
+    def download_ticker_types(self) -> pl.DataFrame:
+        """
+        /v3/reference/tickers/types (API v3 endpoint)
+        """
+        logger.info("Downloading ticker types...")
+        endpoint = "/v3/reference/tickers/types"
+        # Nota: algunos despliegues usan 'ticker-types' (con guion). Polygon documenta ambos; probamos este
+        data = self._make_request(endpoint, {"asset_class": "stocks"})
+        if not data or "results" not in data:
+            logger.warning("No ticker types found")
+            return pl.DataFrame()
+        df = pl.DataFrame(data["results"])
+        out = self.raw_dir / "reference" / "ticker_types.parquet"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out, compression="zstd")
+        logger.info(f"Saved {len(df)} ticker types to {out}")
+        return df
+
+    def download_market_holidays(self) -> pl.DataFrame:
+        """
+        /v1/marketstatus/upcoming  (y opcional /v1/marketstatus/now para sanity)
+        """
+        logger.info("Downloading market holidays (upcoming)...")
+        endpoint = "/v1/marketstatus/upcoming"
+        data = self._make_request(endpoint)
+        # formato: lista simple de próximos feriados / cierres
+        if not data:
+            logger.warning("No upcoming holidays data")
+            return pl.DataFrame()
+        # Algunas respuestas son lista, otras dict; normalizamos
+        results = data if isinstance(data, list) else data.get("exchanges", []) or data.get("market", []) or []
+        df = pl.DataFrame(results) if results else pl.DataFrame()
+        out = self.raw_dir / "reference" / "holidays_upcoming.parquet"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out, compression="zstd")
+        logger.info(f"Saved {len(df)} holidays to {out}")
+        return df
+
+    def download_condition_codes(self, kind: str = "trades") -> pl.DataFrame:
+        """
+        /v3/reference/conditions (API v3 endpoint, kind via asset_class param)
+        """
+        if kind not in ("trades", "quotes"):
+            raise ValueError("kind must be 'trades' or 'quotes'")
+        logger.info(f"Downloading condition codes: {kind}")
+        endpoint = "/v3/reference/conditions"
+        params = {"asset_class": "stocks", "data_types": kind, "limit": 1000}
+        results = []
+        next_url = None
+
+        while True:
+            data = self._make_request(next_url if next_url else endpoint, params if not next_url else None)
+            if not data or "results" not in data:
+                break
+            results.extend(data["results"])
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+
+        if not results:
+            logger.warning(f"No condition codes ({kind}) found")
+            return pl.DataFrame()
+
+        df = pl.DataFrame(results)
+        out = self.raw_dir / "reference" / f"conditions_{kind}.parquet"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out, compression="zstd")
+        logger.info(f"Saved {len(df)} {kind} condition codes to {out}")
+        return df
+
+    def download_ticker_details(self, symbols: list[str]) -> pl.DataFrame:
+        """
+        /v3/reference/tickers/{ticker}
+        Hace requests por símbolo (no hay batch API). Concurrency control via rate limiter.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if not symbols:
+            logger.warning("No symbols provided for ticker details")
+            return pl.DataFrame()
+
+        logger.info(f"Downloading ticker details for {len(symbols)} symbols...")
+        base_out_dir = self.raw_dir / "reference" / "details"
+        base_out_dir.mkdir(parents=True, exist_ok=True)
+
+        def fetch_one(sym: str) -> dict | None:
+            endpoint = f"/v3/reference/tickers/{sym}"
+            data = self._make_request(endpoint)
+            if data and "results" in data and data["results"]:
+                # Persistir también individualmente por si queremos quick-reads
+                out = base_out_dir / f"{sym}.parquet"
+                try:
+                    pl.DataFrame([data["results"]]).write_parquet(out, compression="zstd")
+                except Exception as e:
+                    logger.warning(f"Failed writing details for {sym}: {e}")
+                return data["results"]
+            return None
+
+        records = []
+        max_workers = int(self.config["reference_endpoints"].get("details_max_workers", 8))
+        batch_size = int(self.config["reference_endpoints"].get("details_batch_size", 200))
+
+        # Procesamos en lotes para no abrir miles de futures a la vez
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = {ex.submit(fetch_one, s): s for s in batch}
+                for fut in as_completed(futs):
+                    try:
+                        res = fut.result()
+                        if res:
+                            records.append(res)
+                    except Exception as e:
+                        logger.warning(f"Details fetch error: {e}")
+
+            logger.info(f"Details progress: {min(i+batch_size, len(symbols))}/{len(symbols)}")
+
+        if not records:
+            logger.warning("No ticker details retrieved")
+            return pl.DataFrame()
+
+        df = pl.DataFrame(records)
+        # master parquet también
+        all_out = self.raw_dir / "reference" / "ticker_details_all.parquet"
+        df.write_parquet(all_out, compression="zstd")
+        logger.info(f"Saved ticker details master to {all_out} ({len(df)} rows)")
+        return df
+
 
 def main():
     parser = argparse.ArgumentParser(description="Polygon.io data ingestion")

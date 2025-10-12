@@ -18,6 +18,23 @@ polygon:
     short_interest: "/v3/reference/short_interest"
     short_volume: "/v3/reference/short_volume"
 
+# Reference Data Endpoints (Additional metadata)
+reference_endpoints:
+  enable_ticker_details: true
+  enable_holidays: true
+  enable_exchanges: true
+  enable_ticker_types: true
+  enable_condition_codes: true
+
+  # Chunking para /tickers/{symbol} (no es batch API, sino procesamiento paralelo)
+  details_batch_size: 200     # Nº símbolos por batch en memoria
+  details_max_workers: 8      # Hilos para acelerar descarga paralela (seguro con rate limit)
+
+  # Condition codes
+  conditions:
+    trades: true
+    quotes: true
+
 # Data Paths
 paths:
   base_dir: "D:/04_TRADING_SMALLCAPS"
@@ -26,6 +43,7 @@ paths:
   models: "models"
   logs: "logs"
   labels: "labels"
+  reference: "reference"  # Explícito para rutas de reference data
 
 # Universe Definition (Small Caps)
 universe:
@@ -124,6 +142,359 @@ processing:
       min_rvol_day: 1.5
       min_dollar_vol_day: 1000000
       min_minutes_with_trades_pct: 0.7
+
+  # === INTRADAY EVENT DETECTION (FASE 2.5) ===
+  # Detecta eventos de microestructura sobre barras 1min (alcistas Y bajistas)
+  intraday_events:
+    enable: true
+
+    # Sesiones (America/New_York timezone)
+    session_bounds:
+      premarket: ["04:00", "09:30"]
+      rth: ["09:30", "16:00"]
+      afterhours: ["16:00", "20:00"]
+
+    # Filtros globales
+    global_filters:
+      min_price: 1.0
+      max_price: 500.0
+      min_dollar_volume_day: 500000
+      market_hours_only: false
+      exclude_premarket: false
+      exclude_afterhours: false
+
+      # Filtros específicos para short setups (más estrictos por riesgo squeeze)
+      bearish_filters:
+        min_dollar_volume_day: 1000000
+        min_float: 10000000
+        max_short_interest_pct: 40
+        max_days_to_cover: 5
+
+      bullish_filters:
+        min_dollar_volume_day: 500000
+        min_float: 5000000
+
+    # DETECTOR 1: Volume Spike (cambio volumen explosivo)
+    volume_spike:
+      enable: true
+      direction: "both"
+      rolling_window_minutes: 20
+      rolling_method: "median"
+      min_range_1m_pct: 1.5
+      cooldown_minutes: 5
+      max_events_per_symbol_day: 10
+
+      rth:
+        min_spike: 6.0
+        min_absolute_volume: 10000
+        min_dollar_volume: 50000
+      pm_ah:
+        min_spike: 8.0
+        min_absolute_volume: 15000
+        min_dollar_volume: 75000
+
+      bearish_confirmation:
+        min_consecutive_red_bars: 2
+        min_drop_from_high_pct: 2.0
+
+    # DETECTOR 2: VWAP Break (reclaim alcista / rejection bajista)
+    vwap_break:
+      enable: true
+      direction: "both"
+      vwap_reference: "RTH"
+      cooldown_minutes: 10
+
+      bullish:
+        min_distance_pct: 0.6
+        min_volume_confirm: 2.0
+        min_consecutive_bars: 2
+
+      bearish:
+        min_distance_pct: 0.8
+        min_volume_confirm: 2.5
+        min_consecutive_bars: 3
+        require_failed_reclaim: true
+        failed_reclaim_window: 10
+
+    # DETECTOR 3: Price Momentum (movimiento rápido precio)
+    price_momentum:
+      enable: true
+      direction: "both"
+      window_minutes: 5
+      min_volume_multiplier: 1.8
+      cooldown_minutes: 15
+
+      bullish:
+        min_change_pct: 3.0
+        require_breakout: true
+
+      bearish:
+        min_change_pct: 3.5
+        require_breakdown: true
+        min_acceleration: 1.2
+
+    # DETECTOR 4: Consolidation Break (base plana → ruptura)
+    consolidation_break:
+      enable: true
+      direction: "both"
+      consolidation_window_minutes: 30
+      max_range_atr_multiple: 0.5
+      min_breakout_pct: 1.0
+      min_volume_spike: 2.0
+      cooldown_minutes: 20
+
+    # DETECTOR 5: Opening Range Break (solo RTH)
+    opening_range_break:
+      enable: true
+      direction: "both"
+      or_duration_minutes: 15
+      min_breakout_pct: 0.5
+      min_volume_confirm: 1.8
+      cooldown_minutes: 30
+      apply_only_in_session: "RTH"
+
+    # DETECTOR 6: Tape Speed (velocidad trades - DISABLED hasta tener /trades)
+    tape_speed:
+      enable: false
+      min_transactions_per_minute: 50
+      min_spike: 3.0
+      cooldown_minutes: 5
+
+    # DETECTOR 7: Flush Detection (capitulation bajista)
+    flush_detection:
+      enable: true
+      min_drop_pct: 8.0
+      window_minutes: 15
+      min_volume_spike: 4.0
+      min_consecutive_red_bars: 3
+      require_wick_recovery: false
+      volume_acceleration: true
+      cooldown_minutes: 20
+
+    # Deduplicación de eventos superpuestos
+    deduplication:
+      enable: true
+      window_minutes: 10
+      mode: "score_based"
+      keep_both_if_score_diff_pct: 10
+
+      score_weights:
+        volume_spike_magnitude: 0.3
+        price_change_magnitude: 0.25
+        volume_confirm: 0.2
+        consecutive_bars: 0.15
+        distance_from_vwap: 0.1
+
+    # Configuración de output
+    output:
+      format: "parquet"
+      compression: "zstd"
+      partition_by: ["date"]
+      include_bar_data: true
+      include_context_bars: 5
+
+      metadata_fields:
+        - direction
+        - event_bias
+        - session
+        - spike_x
+        - ret_1m
+        - ret_5m
+        - close_vs_open
+        - close_vs_vwap
+        - setup_type
+        - tier
+
+    # Tape reading: micro-ventanas para trades/quotes (FASE 3.2)
+    # NOTA: Los valores por defecto son para CORE profile
+    # Se pueden sobreescribir activando profiles.active_profile: plus|premium
+    event_tape_window_before_minutes: 3   # Descargar [-3min antes del evento] (CORE)
+    event_tape_window_after_minutes: 7    # Descargar [+7min después del evento] (CORE)
+
+    # Extensión dinámica de ventanas (si hay señal fuerte)
+    dynamic_extension:
+      enable: true
+      extend_to_before_minutes: 10
+      extend_to_after_minutes: 20
+      # Disparadores para extender ventana (cualquiera que se cumpla)
+      triggers:
+        tape_speed_pctl: 90         # Tape speed > p90 histórico del símbolo
+        nbbo_spread_pctl: 90        # NBBO spread > p90 (proxy de stress liquidez)
+        vol_spike_x: 8.0            # Volumen minuto > 8x MA 20min
+
+  # Manifest de eventos (selección y diversidad)
+  intraday_manifest:
+    events_glob: "processed/events/events_intraday_*.parquet"
+    max_events: 10000               # CORE: Top 10K eventos
+    max_per_symbol: 3               # Máx 3 eventos por símbolo
+    max_per_symbol_day: 1           # Máx 1 evento por símbolo-día
+    min_event_score: 0.60           # Ignorar eventos con score < 0.60
+
+    # Sesiones permitidas
+    allow_sessions:
+      premarket: true
+      rth: true
+      afterhours: true
+
+    # Priorización de tipos de evento (por score)
+    priority_event_types:
+      - volume_spike
+      - vwap_break
+      - opening_range_break
+      - price_momentum
+      - consolidation_break
+      - flush
+
+    # Cobertura temporal (% mínimo por franja horaria)
+    ensure_time_buckets:
+      "0930-1015": 0.25   # Apertura
+      "1015-1400": 0.35   # Medio día
+      "1400-1600": 0.25   # Power hour
+      "0400-0930": 0.10   # Premarket
+      "1600-2000": 0.05   # Afterhours
+
+  # Configuración de descarga de trades/quotes
+  micro_download:
+    trades:
+      enabled: true
+      columns_keep:
+        - timestamp
+        - price
+        - size
+        - exchange
+        - conditions
+        - sequence_number
+      compression: zstd
+
+    quotes:
+      enabled: true
+      # CORE: NBBO "light" - solo cambios o máx 5 Hz
+      downsample:
+        by_change_only: true        # Guardar solo cuando cambia NBBO
+        max_rate_hz: 5              # O como mucho 5 muestras/segundo
+      columns_keep:
+        - timestamp
+        - bid_price
+        - bid_size
+        - ask_price
+        - ask_size
+        - bid_exchange
+        - ask_exchange
+        - indicators
+      compression: zstd
+
+  # Filtros de liquidez (evitar eventos fantasma)
+  liquidity_filters:
+    # Por barra del evento
+    min_dollar_volume_bar: 100000   # >= $100K en la barra del evento
+    min_absolute_volume_bar: 10000  # >= 10K shares
+    max_spread_proxy_pct: 5.0       # (high-low)/vwap <= 5% en la barra
+
+    # Por día
+    min_dollar_volume_day: 500000   # >= $500K en el día
+    rvol_day_min: 1.5               # Volumen relativo >= 1.5x
+
+    # SSR heurística (si no hay flag)
+    ssr_heuristic:
+      enable: true
+      threshold_down_pct: -10.0     # Si day_return <= -10% → SSR probable
+
+  # ============================================================================
+  # 🧩 PERFILES: CORE / PLUS / PREMIUM
+  # ============================================================================
+  # Usa estos perfiles para 'subir de marcha'. Cambia solo `active_profile`.
+  # - CORE: Top 10K eventos, ventanas cortas, NBBO 5Hz → ~30GB, 1-2 días descarga
+  # - PLUS: 20K eventos, ventanas extendidas para cohortes ganadoras
+  # - PREMIUM: 50K eventos, microestructura completa para laboratorio
+
+  profiles:
+    active_profile: "core"     # ← cambia aquí: core | plus | premium
+
+    core:
+      intraday_manifest:
+        max_events: 10000
+        max_per_symbol: 3
+        max_per_symbol_day: 1
+        min_event_score: 0.60
+
+      dynamic_extension:
+        enable: true
+        triggers:
+          tape_speed_pctl: 90
+          nbbo_spread_pctl: 90
+          vol_spike_x: 8.0
+
+      micro_download:
+        quotes:
+          downsample:
+            by_change_only: true
+            max_rate_hz: 5         # 5Hz máximo
+
+      liquidity_filters:
+        min_dollar_volume_bar: 100000
+        min_absolute_volume_bar: 10000
+        min_dollar_volume_day: 500000
+        rvol_day_min: 1.5
+
+    plus:
+      intraday_manifest:
+        max_events: 20000
+        max_per_symbol: 5
+        max_per_symbol_day: 2
+        min_event_score: 0.50
+
+      dynamic_extension:
+        enable: true
+        triggers:
+          tape_speed_pctl: 85      # Más agresivo
+          nbbo_spread_pctl: 85
+          vol_spike_x: 6.0
+
+      event_tape_window_before_minutes: 5
+      event_tape_window_after_minutes: 15
+
+      micro_download:
+        quotes:
+          downsample:
+            by_change_only: false  # Guardar todas las quotes
+            max_rate_hz: 20        # 20Hz
+
+      liquidity_filters:
+        min_dollar_volume_bar: 50000
+        min_absolute_volume_bar: 5000
+        min_dollar_volume_day: 250000
+        rvol_day_min: 1.2
+
+    premium:
+      intraday_manifest:
+        max_events: 50000
+        max_per_symbol: 10
+        max_per_symbol_day: 3
+        min_event_score: 0.40      # Más permisivo
+
+      dynamic_extension:
+        enable: true
+        extend_to_before_minutes: 15
+        extend_to_after_minutes: 30
+        triggers:
+          tape_speed_pctl: 80      # Muy agresivo
+          nbbo_spread_pctl: 80
+          vol_spike_x: 4.0
+
+      event_tape_window_before_minutes: 10
+      event_tape_window_after_minutes: 20
+
+      micro_download:
+        quotes:
+          downsample:
+            by_change_only: false
+            max_rate_hz: 50        # 50Hz - full microstructure
+
+      liquidity_filters:
+        min_dollar_volume_bar: 25000
+        min_absolute_volume_bar: 2500
+        min_dollar_volume_day: 100000
+        rvol_day_min: 1.0
 
   # Event Windows (D-2 to D+2 for swing)
   events_windows:
