@@ -136,8 +136,18 @@ def load_events_shards(shards_dir: Path) -> pl.DataFrame:
 
     # Check for enriched file first (most recent)
     events_dir = Path("D:/04_TRADING_SMALLCAPS/processed/events")
-    enriched_files = sorted(events_dir.glob("events_intraday_enriched_*.parquet"))
 
+    # PRIORITY: Use deduplicated file if available
+    dedup_files = sorted(events_dir.glob("events_intraday_enriched_dedup_*.parquet"))
+    if dedup_files:
+        latest_enriched = dedup_files[-1]
+        print(f"  Loading DEDUPLICATED file: {latest_enriched.name}")
+        df = pl.read_parquet(latest_enriched)
+        print(f"  Loaded {len(df):,} events from {df['symbol'].n_unique()} symbols")
+        return df
+
+    # Fallback to any enriched file
+    enriched_files = sorted(events_dir.glob("events_intraday_enriched_*.parquet"))
     if enriched_files:
         latest_enriched = enriched_files[-1]
         print(f"  Loading enriched file: {latest_enriched.name}")
