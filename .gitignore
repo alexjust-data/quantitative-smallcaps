@@ -69,11 +69,20 @@ desktop.ini
 tmp/
 temp/
 *.tmp
+*.temp
 *.bak
 nul
 analysis_output.txt
 worker_*.txt
 *_output.txt
+
+# Deprecated/archived files (tracked in archive/)
+archive/deprecated/
+archive/backups/*.tar.gz
+
+# Launcher temp files
+launch_*.bat.tmp
+*.log.tmp
 
 # DuckDB
 *.duckdb
