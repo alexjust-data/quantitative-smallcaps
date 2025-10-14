@@ -23,16 +23,46 @@ import polars as pl
 import numpy as np
 from loguru import logger
 from zoneinfo import ZoneInfo
+import json
+import gc
+import psutil
+import signal
+from contextlib import contextmanager
 
 # Setup paths
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+class TimeoutError(Exception):
+    """Raised when operation times out"""
+    pass
+
+
+@contextmanager
+def timeout(seconds: int):
+    """Context manager para timeout de operaciones (solo Unix/Linux)"""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+
+    # En Windows, signal.SIGALRM no existe, así que simplemente no hacemos nada
+    if hasattr(signal, 'SIGALRM'):
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # Windows: no timeout, solo yield
+        yield
+
+
 class IntradayEventDetector:
     """Detector de eventos intraday sobre barras 1min (bidireccional)"""
 
-    def __init__(self, config_path: Path = None):
+    def __init__(self, config_path: Path = None, output_dir: Path = None):
         if config_path is None:
             config_path = PROJECT_ROOT / "config" / "config.yaml"
 
@@ -44,10 +74,35 @@ class IntradayEventDetector:
 
         # Directorios
         self.raw_bars_dir = PROJECT_ROOT / "raw" / "market_data" / "bars" / "1m"
-        self.output_dir = PROJECT_ROOT / "processed" / "events"
+
+        # Use custom output_dir if provided (for parallel workers)
+        if output_dir:
+            self.shards_dir = Path(output_dir)
+            self.output_dir = self.shards_dir.parent.parent  # Go up to events dir
+        else:
+            self.output_dir = PROJECT_ROOT / "processed" / "events"
+            self.shards_dir = self.output_dir / "shards"
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.shards_dir.mkdir(parents=True, exist_ok=True)
+
+        # Directorios para checkpointing y heartbeat
+        self.checkpoint_dir = PROJECT_ROOT / "logs" / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.heartbeat_dir = PROJECT_ROOT / "logs" / "heartbeats"
+        self.heartbeat_dir.mkdir(parents=True, exist_ok=True)
+
+        # Process monitoring
+        self.process = psutil.Process()
+
+        # Log file references (set from main())
+        self.heartbeat_log_file = None
+        self.batch_log_file = None
 
         logger.info(f"IntradayEventDetector initialized (config: {config_path})")
+        logger.info(f"  Checkpoint dir: {self.checkpoint_dir}")
+        logger.info(f"  Heartbeat dir: {self.heartbeat_dir}")
+        logger.info(f"  Shards dir: {self.shards_dir}")
 
     def classify_session(self, ts: datetime) -> Literal["PM", "RTH", "AH"]:
         """Clasifica timestamp en sesión (PM/RTH/AH)"""
@@ -373,7 +428,7 @@ class IntradayEventDetector:
 
         logger.info(f"Consolidation breaks detected: {len(events)}")
         # Cast to Float64 for schema consistency
-        events = events.with_columns([pl.col("spike_x").cast(pl.Float64)])
+        events = events.with_columns([pl.col("vol_spike").alias("spike_x").cast(pl.Float64)])
         return events.select(["symbol", "timestamp", "event_type", "direction", "session", "spike_x",
                                "open", "high", "low", "close", "volume", "dollar_volume", "score"])
 
@@ -536,9 +591,16 @@ class IntradayEventDetector:
             return pl.DataFrame()
 
         try:
+            # Intentar leer el archivo parquet con manejo robusto de errores
             df_original = pl.read_parquet(bars_file)
+        except TimeoutError:
+            logger.error(f"[TIMEOUT] {symbol} {date} - file may be corrupted or too large")
+            return pl.DataFrame()
+        except (OSError, IOError) as e:
+            logger.error(f"[I/O ERROR] {symbol} {date}: {e}")
+            return pl.DataFrame()
         except Exception as e:
-            logger.warning(f"Failed to read {bars_file}: {e}")
+            logger.error(f"[FAILED] {symbol} {date}: {type(e).__name__}: {e}")
             return pl.DataFrame()
 
         if df_original.is_empty() or len(df_original) < 30:  # At least 30 bars (30min data)
@@ -629,68 +691,538 @@ class IntradayEventDetector:
 
         return combined
 
-    def run(self, symbols: list[str], start_date: str, end_date: str):
-        """Ejecuta detección para lista de símbolos y rango de fechas"""
-        from datetime import datetime, timedelta
+    def get_available_dates_for_symbol(self, symbol: str) -> list[str]:
+        """
+        Escanea directorio del símbolo y retorna lista de fechas disponibles.
 
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        Args:
+            symbol: Ticker symbol
 
-        all_events = []
-        date_range = []
-        current = start
-        while current <= end:
-            date_range.append(current.strftime("%Y-%m-%d"))
-            current += timedelta(days=1)
+        Returns:
+            List of date strings (YYYY-MM-DD) with available data
+        """
+        symbol_dir = self.raw_bars_dir / f"symbol={symbol}"
 
-        logger.info(f"Processing {len(symbols)} symbols × {len(date_range)} dates = {len(symbols)*len(date_range)} symbol-dates")
+        if not symbol_dir.exists():
+            return []
 
-        for symbol in symbols:
-            symbol_events = []
-            for date in date_range:
-                events = self.process_symbol_date(symbol, date)
-                if not events.is_empty():
-                    symbol_events.append(events)
+        dates = []
+        for file_path in symbol_dir.glob("date=*.parquet"):
+            # Extract date from filename: date=YYYY-MM-DD.parquet
+            date_str = file_path.stem.replace("date=", "")
+            dates.append(date_str)
 
-            if symbol_events:
-                combined = pl.concat(symbol_events, how="diagonal")
-                all_events.append(combined)
-                logger.info(f"{symbol}: {len(combined)} events detected")
+        return sorted(dates)
 
-        if not all_events:
-            logger.warning("No events detected")
-            return None
+    def load_checkpoint(self, run_id: str) -> set[str]:
+        """
+        Carga checkpoint con símbolos ya procesados.
 
-        final = pl.concat(all_events, how="diagonal")
+        Args:
+            run_id: ID único del run (ej: events_intraday_20251012)
 
-        # Sort por timestamp
+        Returns:
+            Set de símbolos ya completados
+        """
+        checkpoint_file = self.checkpoint_dir / f"{run_id}_completed.json"
+
+        if not checkpoint_file.exists():
+            logger.info(f"No checkpoint found, starting fresh")
+            return set()
+
+        try:
+            with open(checkpoint_file, 'r') as f:
+                data = json.load(f)
+                completed = set(data.get("completed_symbols", []))
+                logger.info(f"[CHECKPOINT] Loaded checkpoint: {len(completed)} symbols already completed")
+                return completed
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}, starting fresh")
+            return set()
+
+    def save_checkpoint(self, run_id: str, completed_symbols: set[str]):
+        """
+        Guarda checkpoint con símbolos completados.
+
+        Args:
+            run_id: ID único del run
+            completed_symbols: Set de símbolos completados
+        """
+        checkpoint_file = self.checkpoint_dir / f"{run_id}_completed.json"
+
+        data = {
+            "run_id": run_id,
+            "completed_symbols": sorted(list(completed_symbols)),
+            "total_completed": len(completed_symbols),
+            "last_updated": datetime.now().isoformat()
+        }
+
+        try:
+            with open(checkpoint_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+
+    def update_heartbeat(self, run_id: str, symbol: str, batch_num: int, total_batches: int,
+                        events_count: int):
+        """
+        Actualiza heartbeat con progreso actual.
+
+        Args:
+            run_id: ID del run
+            symbol: Símbolo actual
+            batch_num: Número de batch actual
+            total_batches: Total de batches
+            events_count: Total de eventos detectados hasta ahora
+        """
+        heartbeat_file = self.heartbeat_dir / f"{run_id}_heartbeat.json"
+
+        try:
+            mem_info = self.process.memory_info()
+            mem_gb = mem_info.rss / (1024 ** 3)
+
+            data = {
+                "run_id": run_id,
+                "last_symbol": symbol,
+                "last_timestamp": datetime.now().isoformat(),
+                "batch_num": batch_num,
+                "total_batches": total_batches,
+                "progress_pct": (batch_num / total_batches * 100) if total_batches > 0 else 0,
+                "events_detected": events_count,
+                "memory_gb": round(mem_gb, 2),
+                "status": "running"
+            }
+
+            with open(heartbeat_file, 'w') as f:
+                json.dump(data, f, indent=2)
+
+        except Exception as e:
+            logger.warning(f"Failed to update heartbeat: {e}")
+
+    def save_batch_shard(self, batch_df: pl.DataFrame, run_id: str, shard_num: int):
+        """
+        Guarda un shard (batch) de eventos a disco.
+
+        Args:
+            batch_df: DataFrame con eventos del batch
+            run_id: ID del run
+            shard_num: Número de shard
+        """
+        shard_file = self.shards_dir / f"{run_id}_shard{shard_num:04d}.parquet"
+
+        try:
+            batch_df.write_parquet(shard_file, compression="zstd")
+            logger.info(f"[SAVED] Shard {shard_num}: {len(batch_df)} events -> {shard_file.name}")
+        except Exception as e:
+            logger.error(f"Failed to save shard {shard_num}: {e}")
+            raise
+
+    def merge_shards(self, run_id: str) -> pl.DataFrame:
+        """
+        Fusiona todos los shards en un solo archivo final.
+
+        Args:
+            run_id: ID del run
+
+        Returns:
+            DataFrame con todos los eventos fusionados
+        """
+        shard_pattern = f"{run_id}_shard*.parquet"
+        shard_files = sorted(self.shards_dir.glob(shard_pattern))
+
+        if not shard_files:
+            logger.warning("No shards found to merge")
+            return pl.DataFrame()
+
+        logger.info(f"Merging {len(shard_files)} shards...")
+
+        all_shards = []
+        for shard_file in shard_files:
+            try:
+                df = pl.read_parquet(shard_file)
+                all_shards.append(df)
+                logger.debug(f"  Loaded {shard_file.name}: {len(df)} events")
+            except Exception as e:
+                logger.error(f"Failed to load shard {shard_file}: {e}")
+
+        if not all_shards:
+            return pl.DataFrame()
+
+        final = pl.concat(all_shards, how="diagonal")
         final = final.sort(["symbol", "timestamp"])
 
-        # Save
-        output_file = self.output_dir / f"events_intraday_{end_date.replace('-', '')}.parquet"
+        logger.info(f"[MERGED] {len(shard_files)} shards -> {len(final)} total events")
+        return final
+
+    def run(self, symbols: list[str], start_date: str = None, end_date: str = None,
+            batch_size: int = 50, resume: bool = False, checkpoint_interval: int = 1):
+        """
+        Ejecuta detección para lista de símbolos con batching, checkpointing y heartbeat.
+
+        Args:
+            symbols: Lista de símbolos a procesar
+            start_date: Fecha inicio (opcional)
+            end_date: Fecha fin (opcional)
+            batch_size: Tamaño del batch (símbolos por shard)
+            resume: Si True, carga checkpoint y salta símbolos completados
+            checkpoint_interval: Guardar checkpoint cada N batches
+
+        Returns:
+            DataFrame con todos los eventos detectados
+        """
+        from datetime import datetime
+
+        # Setup run
+        output_date = datetime.now().strftime("%Y%m%d")
+        run_id = f"events_intraday_{output_date}"
+
+        # Load checkpoint si resume=True
+        completed_symbols = set()
+        if resume:
+            completed_symbols = self.load_checkpoint(run_id)
+            symbols = [s for s in symbols if s not in completed_symbols]
+            logger.info(f"Resume mode: {len(symbols)} symbols remaining to process")
+
+        if not symbols:
+            logger.info("All symbols already completed!")
+            # Merge shards existentes
+            final = self.merge_shards(run_id)
+            if not final.is_empty():
+                output_file = self.output_dir / f"{run_id}.parquet"
+                final.write_parquet(output_file, compression="zstd")
+                logger.info(f"[FINAL] Final file: {output_file}")
+            return final
+
+        total_batches = (len(symbols) + batch_size - 1) // batch_size
+        logger.info(f"Processing {len(symbols)} symbols in {total_batches} batches (size={batch_size})")
+
+        total_events = 0
+        shard_num = len(list(self.shards_dir.glob(f"{run_id}_shard*.parquet")))  # Continue shard numbering
+
+        for batch_idx in range(0, len(symbols), batch_size):
+            batch = symbols[batch_idx:batch_idx + batch_size]
+            batch_num = (batch_idx // batch_size) + 1
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"BATCH {batch_num}/{total_batches} ({len(batch)} symbols)")
+            logger.info(f"{'='*60}")
+
+            batch_events = []
+
+            for symbol in batch:
+                # Get memory usage
+                mem_info = self.process.memory_info()
+                mem_gb = mem_info.rss / (1024 ** 3)
+
+                # Update heartbeat (JSON y log separado)
+                self.update_heartbeat(run_id, symbol, batch_num, total_batches, total_events)
+
+                # Log heartbeat a archivo separado
+                if self.heartbeat_log_file:
+                    log_heartbeat(self.heartbeat_log_file, symbol, total_events, batch_num,
+                                total_batches, mem_gb)
+
+                # Get available dates for this symbol
+                available_dates = self.get_available_dates_for_symbol(symbol)
+
+                if not available_dates:
+                    logger.debug(f"{symbol}: No data files found")
+                    completed_symbols.add(symbol)
+                    continue
+
+                # Filter by date range if provided
+                if start_date and end_date:
+                    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+                    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+                    available_dates = [
+                        d for d in available_dates
+                        if start <= datetime.strptime(d, "%Y-%m-%d").date() <= end
+                    ]
+
+                if not available_dates:
+                    logger.debug(f"{symbol}: No data in date range")
+                    completed_symbols.add(symbol)
+                    continue
+
+                # Process all available dates for this symbol
+                symbol_events = []
+                total_days = len(available_dates)
+
+                logger.info(f"[START] {symbol}: Starting processing of {total_days} days")
+
+                for day_idx, date in enumerate(available_dates, 1):
+                    # Log progress every 100 days to detect stalls
+                    if day_idx % 100 == 0:
+                        logger.info(f"[PROGRESS] {symbol}: Processing day {day_idx}/{total_days} ({date})")
+
+                    try:
+                        events = self.process_symbol_date(symbol, date)
+                        if not events.is_empty():
+                            symbol_events.append(events)
+                    except Exception as e:
+                        logger.error(f"[ERROR] {symbol} {date}: Unexpected error: {type(e).__name__}: {e}")
+                        continue  # Skip this date but continue with others
+
+                if symbol_events:
+                    combined = pl.concat(symbol_events, how="diagonal")
+                    batch_events.append(combined)
+                    total_events += len(combined)
+                    logger.info(f"[DONE] {symbol}: {len(combined)} events from {total_days} days ({len(symbol_events)} days with events)")
+                else:
+                    logger.debug(f"{symbol}: No events detected")
+
+                # Mark symbol as completed
+                completed_symbols.add(symbol)
+
+                # Save checkpoint after EVERY symbol for maximum robustness
+                # This ensures we never lose more than 1 symbol of work
+                self.save_checkpoint(run_id, completed_symbols)
+
+                # Save shard incrementally every 10 symbols to avoid data loss
+                # This way if process is killed, we only lose max 10 symbols of events
+                if len(batch_events) >= 10:
+                    batch_df = pl.concat(batch_events, how="diagonal")
+                    batch_df = batch_df.sort(["symbol", "timestamp"])
+
+                    # Save shard
+                    self.save_batch_shard(batch_df, run_id, shard_num)
+
+                    # Log
+                    mem_info = self.process.memory_info()
+                    mem_gb = mem_info.rss / (1024 ** 3)
+                    if self.batch_log_file:
+                        log_batch_saved(self.batch_log_file, batch_num, batch, len(batch_df),
+                                      self.shards_dir / f"{run_id}_shard{shard_num:04d}.parquet", mem_gb)
+
+                    shard_num += 1
+
+                    # Clear batch events from memory
+                    batch_events.clear()
+                    del batch_df
+                    gc.collect()
+
+                # Log checkpoint less frequently to avoid log spam
+                if len(completed_symbols) % 10 == 0:
+                    logger.info(f"[CHECKPOINT] Progress saved: {len(completed_symbols)} symbols completed")
+
+            # Save batch shard immediately
+            if batch_events:
+                batch_df = pl.concat(batch_events, how="diagonal")
+                batch_df = batch_df.sort(["symbol", "timestamp"])
+
+                # Guardar shard
+                shard_file = self.shards_dir / f"{run_id}_shard{shard_num:04d}.parquet"
+                self.save_batch_shard(batch_df, run_id, shard_num)
+                total_events += len(batch_df)
+
+                # Log batch guardado a archivo separado
+                mem_info = self.process.memory_info()
+                mem_gb = mem_info.rss / (1024 ** 3)
+
+                if self.batch_log_file:
+                    log_batch_saved(self.batch_log_file, batch_num, batch, len(batch_df),
+                                  shard_file, mem_gb)
+
+                # Log uso de recursos
+                log_resource_usage()
+
+                shard_num += 1
+
+                # Clear memory
+                del batch_events
+                del batch_df
+                gc.collect()
+
+            # Save checkpoint periódicamente
+            if batch_num % checkpoint_interval == 0:
+                self.save_checkpoint(run_id, completed_symbols)
+                logger.info(f"[CHECKPOINT] Checkpoint saved: {len(completed_symbols)}/{len(symbols) + len(completed_symbols)} symbols")
+
+        # Save final checkpoint
+        self.save_checkpoint(run_id, completed_symbols)
+        logger.info(f"[COMPLETE] All batches completed: {shard_num} shards saved")
+
+        # Merge all shards into final file
+        logger.info(f"\n{'='*60}")
+        logger.info("Merging shards into final file...")
+        logger.info(f"{'='*60}")
+
+        final = self.merge_shards(run_id)
+
+        if final.is_empty():
+            logger.warning("No events detected in any batch")
+            return None
+
+        # Save final file
+        output_file = self.output_dir / f"{run_id}.parquet"
         final.write_parquet(output_file, compression="zstd")
 
-        logger.info(f"✅ Saved {len(final)} intraday events to {output_file}")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"[SUCCESS] DETECTION COMPLETE")
+        logger.info(f"{'='*60}")
+        logger.info(f"Total events: {len(final):,}")
+        logger.info(f"Output file: {output_file}")
         logger.info(f"\nDistribution by type:\n{final.group_by('event_type').len().sort('len', descending=True)}")
         logger.info(f"\nDistribution by direction:\n{final.group_by('direction').len()}")
         logger.info(f"\nDistribution by session:\n{final.group_by('session').len()}")
 
+        # Update final heartbeat
+        heartbeat_file = self.heartbeat_dir / f"{run_id}_heartbeat.json"
+        try:
+            with open(heartbeat_file, 'w') as f:
+                json.dump({
+                    "run_id": run_id,
+                    "status": "completed",
+                    "total_events": len(final),
+                    "total_symbols": len(completed_symbols),
+                    "completed_at": datetime.now().isoformat()
+                }, f, indent=2)
+        except:
+            pass
+
         return final
 
+
+def setup_logging():
+    """
+    Configura logging robusto con separación de logs y sin dependencia de stdout.
+
+    Estructura:
+    - logs/detect_events/detect_events_intraday_YYYYMMDD_HHMMSS.log (principal)
+    - logs/detect_events/heartbeat_YYYYMMDD.log (progreso incremental)
+    - logs/detect_events/batches_YYYYMMDD.log (batches guardados)
+    """
+    log_dir = PROJECT_ROOT / "logs" / "detect_events"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now()
+    date_str = timestamp.strftime("%Y%m%d")
+    datetime_str = timestamp.strftime("%Y%m%d_%H%M%S")
+
+    # Archivo principal (todo)
+    main_log = log_dir / f"detect_events_intraday_{datetime_str}.log"
+
+    # Archivos auxiliares
+    heartbeat_log = log_dir / f"heartbeat_{date_str}.log"
+    batch_log = log_dir / f"batches_{date_str}.log"
+
+    # Limpiar handlers existentes
+    logger.remove()
+
+    # Handler principal: archivo con rotación
+    logger.add(
+        main_log,
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {process.name}:{thread.name} | {file}:{line} | {message}",
+        enqueue=True,        # Multiproceso seguro
+        backtrace=True,      # Traceback completo en excepciones
+        diagnose=True,       # Contexto adicional en errores
+        rotation="50 MB",    # Rota cada 50 MB
+        retention="7 days",  # Mantiene logs 7 días
+        compression="zip",   # Comprime logs viejos
+        mode="a"             # Append si relanzas (resume)
+    )
+
+    # Handler consola: solo INFO y superior
+    logger.add(
+        sys.stdout,
+        level="INFO",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level>",
+        colorize=True,
+        enqueue=True
+    )
+
+    return {
+        "main_log": main_log,
+        "heartbeat_log": heartbeat_log,
+        "batch_log": batch_log
+    }
+
+def log_heartbeat(heartbeat_file: Path, symbol: str, events_count: int, batch_num: int,
+                  total_batches: int, mem_gb: float):
+    """
+    Registra heartbeat (progreso) en archivo separado.
+
+    Esto permite saber exactamente dónde se detuvo el proceso si falla.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    progress_pct = (batch_num / total_batches * 100) if total_batches > 0 else 0
+
+    # Log principal
+    logger.info(f"[HEARTBEAT] {symbol} | batch={batch_num}/{total_batches} ({progress_pct:.1f}%) | events={events_count:,} | RAM={mem_gb:.2f}GB")
+
+    # Archivo heartbeat separado (append, sin buffer)
+    with open(heartbeat_file, "a", encoding="utf-8", buffering=1) as f:
+        f.write(f"{timestamp}\t{symbol}\t{batch_num}\t{total_batches}\t{events_count}\t{mem_gb:.2f}\n")
+
+def log_batch_saved(batch_file: Path, batch_num: int, symbols: list[str], total_events: int,
+                    shard_file: Path, mem_gb: float):
+    """
+    Registra confirmación de batch guardado.
+
+    Permite verificar qué batches están completos si el proceso se interrumpe.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    # Log principal con nivel SUCCESS
+    logger.success(f"[BATCH SAVED] #{batch_num:03d} | symbols={len(symbols)} | events={total_events:,} | file={shard_file.name} | RAM={mem_gb:.2f}GB")
+
+    # Archivo batch separado
+    with open(batch_file, "a", encoding="utf-8", buffering=1) as f:
+        f.write(f"{timestamp}\t{batch_num}\t{len(symbols)}\t{total_events}\t{shard_file.name}\t{mem_gb:.2f}\n")
+
+def log_resource_usage(interval_symbols: int = 10):
+    """
+    Registra uso de recursos del sistema periódicamente.
+
+    Útil para detectar fugas de memoria o cuellos de botella.
+    """
+    try:
+        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.1)
+        logger.debug(f"[RESOURCE] RAM used: {mem.percent:.1f}% ({mem.used/1e9:.2f}/{mem.total/1e9:.2f} GB) | CPU: {cpu:.1f}%")
+    except Exception as e:
+        logger.warning(f"Failed to log resource usage: {e}")
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Detect intraday events from 1min bars")
+    parser = argparse.ArgumentParser(description="Detect intraday events from 1min bars (Production-grade with batching)")
     parser.add_argument("--symbols", nargs="+", help="List of symbols (or use --from-file)")
     parser.add_argument("--from-file", help="Load symbols from parquet (e.g. events_daily)")
-    parser.add_argument("--start-date", required=True, help="Start date YYYY-MM-DD")
-    parser.add_argument("--end-date", required=True, help="End date YYYY-MM-DD")
+    parser.add_argument("--start-date", help="Start date YYYY-MM-DD (optional - if not provided, processes all available dates)")
+    parser.add_argument("--end-date", help="End date YYYY-MM-DD (optional - if not provided, processes all available dates)")
     parser.add_argument("--limit", type=int, help="Limit number of symbols (for testing)")
+    parser.add_argument("--batch-size", type=int, default=50, help="Batch size (symbols per shard, default: 50)")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint (skip completed symbols)")
+    parser.add_argument("--checkpoint-interval", type=int, default=1, help="Save checkpoint every N batches (default: 1)")
+    parser.add_argument("--worker-id", type=int, help="Worker ID for parallel processing (optional)")
+    parser.add_argument("--output-dir", help="Custom output directory for shards (optional)")
 
     args = parser.parse_args()
 
-    detector = IntradayEventDetector()
+    # Setup logging robusto
+    log_files = setup_logging()
+
+    logger.info("="*80)
+    logger.info("INTRADAY EVENT DETECTION - PRODUCTION MODE")
+    logger.info("="*80)
+    logger.info(f"Main log: {log_files['main_log']}")
+    logger.info(f"Heartbeat log: {log_files['heartbeat_log']}")
+    logger.info(f"Batch log: {log_files['batch_log']}")
+    logger.info(f"Batch size: {args.batch_size} symbols/batch")
+    logger.info(f"Checkpoint interval: every {args.checkpoint_interval} batch(es)")
+    logger.info(f"Resume mode: {args.resume}")
+    if args.worker_id:
+        logger.info(f"Worker ID: {args.worker_id}")
+    if args.output_dir:
+        logger.info(f"Custom output dir: {args.output_dir}")
+    logger.info("="*80)
+
+    detector = IntradayEventDetector(output_dir=Path(args.output_dir) if args.output_dir else None)
+    detector.heartbeat_log_file = log_files['heartbeat_log']
+    detector.batch_log_file = log_files['batch_log']
 
     # Load symbols
     if args.from_file:
@@ -706,7 +1238,22 @@ def main():
         symbols = symbols[:args.limit]
         logger.info(f"Limited to {len(symbols)} symbols")
 
-    detector.run(symbols, args.start_date, args.end_date)
+    # Run detection with batching and checkpointing
+    try:
+        detector.run(
+            symbols,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            batch_size=args.batch_size,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval
+        )
+    except KeyboardInterrupt:
+        logger.warning("[INTERRUPT] Process interrupted by user (Ctrl+C)")
+        logger.info("Progress saved in checkpoint. Use --resume to continue.")
+    except Exception as e:
+        logger.exception(f"Fatal error: {e}")
+        raise
 
 
 if __name__ == "__main__":
