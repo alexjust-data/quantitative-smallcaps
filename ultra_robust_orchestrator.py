@@ -61,6 +61,10 @@ class WorkerProcess:
 
         log(f"Worker {self.worker_id}: Starting (restart #{self.restarts})", "INFO")
 
+        # Aislar salida de shards por worker para evitar colisiones
+        worker_out = PROJECT_ROOT / "processed" / "events" / "shards" / f"worker_{self.worker_id}"
+        worker_out.mkdir(parents=True, exist_ok=True)
+
         # Build command
         cmd = [
             sys.executable,
@@ -69,7 +73,9 @@ class WorkerProcess:
             "--symbols"
         ] + self.symbols + [  # Process ALL assigned symbols
             "--batch-size", "50",
-            "--checkpoint-interval", "1"
+            "--checkpoint-interval", "1",
+            "--resume",
+            "--output-dir", str(worker_out)
         ]
 
         log(f"Worker {self.worker_id}: Command: {' '.join(cmd[:20])}...", "DEBUG")
@@ -181,14 +187,31 @@ def main():
 
     log(f"Total symbols loaded: {len(all_symbols)}", "INFO")
 
-    # Read checkpoint to get completed
-    checkpoint_file = PROJECT_ROOT / "logs" / "checkpoints" / "events_intraday_20251013_completed.json"
+    # Determinar run_id del día y checkpoint correspondiente
+    run_id = f"events_intraday_{datetime.now().strftime('%Y%m%d')}"
+    checkpoint_file = PROJECT_ROOT / "logs" / "checkpoints" / f"{run_id}_completed.json"
     completed = set()
     if checkpoint_file.exists():
         with open(checkpoint_file) as f:
             cp = json.load(f)
         completed = set(cp.get("completed_symbols", []))
         log(f"Checkpoint loaded: {len(completed)} completed symbols", "INFO")
+
+    # Ampliar 'completed' con símbolos observados en manifests (si existen)
+    manifests_dir = PROJECT_ROOT / "processed" / "events" / "manifests"
+    if manifests_dir.exists():
+        observed = set()
+        for mf in manifests_dir.glob(f"{run_id}_shard*.json"):
+            try:
+                data = json.loads(mf.read_text(encoding="utf-8"))
+                for s in data.get("symbols", []):
+                    observed.add(s)
+            except Exception as e:
+                log(f"Manifest read error {mf.name}: {e}", "WARN")
+        if observed:
+            before = len(completed)
+            completed |= observed
+            log(f"Reconciled checkpoint with manifests: +{len(completed)-before} symbols", "INFO")
 
     # Get remaining
     remaining = [s for s in all_symbols if s not in completed]

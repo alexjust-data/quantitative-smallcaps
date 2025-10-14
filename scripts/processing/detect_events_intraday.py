@@ -28,6 +28,8 @@ import gc
 import psutil
 import signal
 from contextlib import contextmanager
+import os
+import uuid
 
 # Setup paths
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +93,8 @@ class IntradayEventDetector:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.heartbeat_dir = PROJECT_ROOT / "logs" / "heartbeats"
         self.heartbeat_dir.mkdir(parents=True, exist_ok=True)
+        self.manifests_dir = self.output_dir / "manifests"
+        self.manifests_dir.mkdir(parents=True, exist_ok=True)
 
         # Process monitoring
         self.process = psutil.Process()
@@ -103,6 +107,7 @@ class IntradayEventDetector:
         logger.info(f"  Checkpoint dir: {self.checkpoint_dir}")
         logger.info(f"  Heartbeat dir: {self.heartbeat_dir}")
         logger.info(f"  Shards dir: {self.shards_dir}")
+        logger.info(f"  Manifests dir: {self.manifests_dir}")
 
     def classify_session(self, ts: datetime) -> Literal["PM", "RTH", "AH"]:
         """Clasifica timestamp en sesión (PM/RTH/AH)"""
@@ -758,8 +763,11 @@ class IntradayEventDetector:
         }
 
         try:
-            with open(checkpoint_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            # Lock de checkpoint para escrituras atómicas
+            lock_file = self.checkpoint_dir / f"{run_id}.lock"
+            with file_lock(lock_file):
+                with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
@@ -801,18 +809,35 @@ class IntradayEventDetector:
 
     def save_batch_shard(self, batch_df: pl.DataFrame, run_id: str, shard_num: int):
         """
-        Guarda un shard (batch) de eventos a disco.
+        Guarda un shard (batch) de eventos a disco con numeración atómica.
 
         Args:
             batch_df: DataFrame con eventos del batch
             run_id: ID del run
-            shard_num: Número de shard
+            shard_num: Número de shard (ignorado, se calcula automáticamente)
         """
-        shard_file = self.shards_dir / f"{run_id}_shard{shard_num:04d}.parquet"
-
+        # 1) Escribe a un tmp único para evitar colisiones entre procesos
+        tmp_file = self.shards_dir / f"{run_id}_{uuid.uuid4().hex}.tmp"
         try:
-            batch_df.write_parquet(shard_file, compression="zstd")
-            logger.info(f"[SAVED] Shard {shard_num}: {len(batch_df)} events -> {shard_file.name}")
+            batch_df.write_parquet(tmp_file, compression="zstd")
+
+            # 2) Sección crítica: asignación de índice bajo lock del run_id
+            lock_file = self.shards_dir / f"{run_id}.lock"
+            with file_lock(lock_file):
+                # Usa búsqueda recursiva para contar todos los shards existentes del run (incluye worker_*)
+                existing = sorted(self.shards_dir.rglob(f"**/{run_id}_shard*.parquet"))
+                next_idx = len(existing)
+                shard_file = self.shards_dir / f"{run_id}_shard{next_idx:04d}.parquet"
+                os.replace(tmp_file, shard_file)  # movimiento atómico
+
+            # 3) Manifest por shard (símbolos únicos)
+            try:
+                symbols = sorted(batch_df.select(pl.col("symbol").unique()).to_series().to_list())
+            except Exception:
+                symbols = []
+            write_shard_manifest(self.manifests_dir, run_id, shard_file.name, symbols, len(batch_df))
+
+            logger.info(f"[SAVED] Shard {next_idx}: {len(batch_df)} events -> {shard_file.name}")
         except Exception as e:
             logger.error(f"Failed to save shard {shard_num}: {e}")
             raise
@@ -827,8 +852,9 @@ class IntradayEventDetector:
         Returns:
             DataFrame con todos los eventos fusionados
         """
+        # Búsqueda recursiva: incluye worker_* y cualquier subcarpeta
         shard_pattern = f"{run_id}_shard*.parquet"
-        shard_files = sorted(self.shards_dir.glob(shard_pattern))
+        shard_files = sorted(self.shards_dir.rglob(f"**/{shard_pattern}"))
 
         if not shard_files:
             logger.warning("No shards found to merge")
@@ -897,7 +923,8 @@ class IntradayEventDetector:
         logger.info(f"Processing {len(symbols)} symbols in {total_batches} batches (size={batch_size})")
 
         total_events = 0
-        shard_num = len(list(self.shards_dir.glob(f"{run_id}_shard*.parquet")))  # Continue shard numbering
+        # Numeración ahora se hace dentro de save_batch_shard() de forma atómica bajo lock
+        shard_num = 0
 
         for batch_idx in range(0, len(symbols), batch_size):
             batch = symbols[batch_idx:batch_idx + batch_size]
@@ -985,7 +1012,7 @@ class IntradayEventDetector:
                     batch_df = pl.concat(batch_events, how="diagonal")
                     batch_df = batch_df.sort(["symbol", "timestamp"])
 
-                    # Save shard
+                    # Guardar shard (asignación de índice atómica interna)
                     self.save_batch_shard(batch_df, run_id, shard_num)
 
                     # Log
@@ -1011,8 +1038,7 @@ class IntradayEventDetector:
                 batch_df = pl.concat(batch_events, how="diagonal")
                 batch_df = batch_df.sort(["symbol", "timestamp"])
 
-                # Guardar shard
-                shard_file = self.shards_dir / f"{run_id}_shard{shard_num:04d}.parquet"
+                # Guardar shard (asignación de índice atómica interna)
                 self.save_batch_shard(batch_df, run_id, shard_num)
                 total_events += len(batch_df)
 
@@ -1138,6 +1164,48 @@ def setup_logging():
         "heartbeat_log": heartbeat_log,
         "batch_log": batch_log
     }
+
+# ----------------------------- LOCK + MANIFEST ------------------------------
+def write_shard_manifest(manifests_dir: Path, run_id: str, shard_name: str,
+                         symbols: list[str], events_count: int):
+    """Manifest simple por shard (≈10 líneas): ayuda a reconciliar checkpoint."""
+    try:
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "run_id": run_id,
+            "shard": shard_name,
+            "symbols": symbols,
+            "events": int(events_count),
+            "written_at": datetime.now().isoformat()
+        }
+        (manifests_dir / shard_name.replace(".parquet", ".json")).write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write manifest for {shard_name}: {e}")
+
+@contextmanager
+def file_lock(path: Path, timeout: int = 30, poll: float = 0.2):
+    """File lock portable con busy-wait corto."""
+    import time
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Lock timeout: {path}")
+            time.sleep(poll)
+    try:
+        yield
+    finally:
+        try:
+            os.remove(str(path))
+        except Exception:
+            pass
 
 def log_heartbeat(heartbeat_file: Path, symbol: str, events_count: int, batch_num: int,
                   total_batches: int, mem_gb: float):

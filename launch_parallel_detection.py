@@ -89,13 +89,18 @@ def main():
 
     processes = []
     for i, (w, wfile) in enumerate(zip(workers, worker_files)):
+        # Aislar salida de shards por worker para evitar colisiones
+        out_dir = PROJECT_ROOT / "processed" / "events" / "shards" / f"worker_{w['worker_id']}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         cmd = [
             sys.executable,
             str(PROJECT_ROOT / "scripts" / "processing" / "detect_events_intraday.py"),
             "--from-file", str(wfile),
             "--batch-size", "50",
-            "--checkpoint-interval", "1"
-            # NOTE: No --resume flag, each worker processes its own fresh list
+            "--checkpoint-interval", "1",
+            "--resume",
+            "--output-dir", str(out_dir)
         ]
 
         # Open log file for this worker
