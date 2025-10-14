@@ -4,6 +4,7 @@ processed/
 models/datasets_ready/
 models/trained_models/
 models/predictions/
+analysis/
 
 # Logs
 logs/
@@ -69,6 +70,10 @@ tmp/
 temp/
 *.tmp
 *.bak
+nul
+analysis_output.txt
+worker_*.txt
+*_output.txt
 
 # DuckDB
 *.duckdb
