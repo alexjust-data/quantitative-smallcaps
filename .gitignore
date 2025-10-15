@@ -94,6 +94,11 @@ processed/.gitkeep
 models/.gitkeep
 logs/.gitkeep
 
+# Educational and reference materials (large files, videos, PDFs)
+docs/edu_trades/
+docs/SersanSistemas/
+docs/Papers/
+
 # Allow specific config templates
 !config/config.template.yaml
 !config/example.env

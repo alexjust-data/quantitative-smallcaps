@@ -1294,8 +1294,14 @@ def main():
 
     # Load symbols
     if args.from_file:
-        df = pl.read_parquet(args.from_file)
-        symbols = df["symbol"].unique().to_list()
+        from_file_path = Path(args.from_file)
+        if from_file_path.suffix.lower() == ".parquet":
+            df = pl.read_parquet(args.from_file)
+            symbols = df["symbol"].unique().to_list()
+        elif from_file_path.suffix.lower() in (".txt", ".csv"):
+            symbols = [line.strip() for line in from_file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        else:
+            raise ValueError(f"Unsupported file type: {from_file_path.suffix}")
         logger.info(f"Loaded {len(symbols)} unique symbols from {args.from_file}")
     elif args.symbols:
         symbols = args.symbols
