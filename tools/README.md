@@ -144,6 +144,91 @@ Discrepancy: 357
 
 ---
 
+## 🔬 Script de Diagnóstico Pre-Lanzamiento
+
+### pre_launch_diagnostics.py / .sh / .bat
+**Diagnóstico completo del sistema ANTES de lanzar workers**
+
+Detecta problemas que pueden causar cuelgues:
+- ✅ Memoria disponible
+- ✅ Espacio en disco
+- ✅ Locks zombies
+- ✅ Procesos activos
+- ✅ Heartbeat congelado
+- ✅ Símbolos con datos masivos (>500 días)
+- ✅ Shards recientes
+- ✅ Consistencia de checkpoints
+
+**Uso básico:**
+
+Desde CMD/PowerShell:
+```cmd
+cd D:\04_TRADING_SMALLCAPS\tools
+pre_launch_diagnostics.bat
+```
+
+Desde Git Bash:
+```bash
+cd /d/04_TRADING_SMALLCAPS/tools
+./pre_launch_diagnostics.sh
+```
+
+**Opciones avanzadas:**
+
+```bash
+# Diagnóstico detallado
+./pre_launch_diagnostics.sh --detailed
+
+# Auto-eliminar locks zombies
+./pre_launch_diagnostics.sh --fix-locks
+```
+
+**Output esperado:**
+
+```
+================================================================================
+[1/8] MEMORIA DISPONIBLE
+================================================================================
+Total RAM: 16.00 GB
+Available: 8.50 GB (53.1%)
+✓ INFO: Memoria suficiente: 8.50 GB
+
+================================================================================
+[2/8] ESPACIO EN DISCO
+================================================================================
+Total disk: 500.00 GB
+Available: 120.00 GB (24.0%)
+✓ INFO: Espacio suficiente: 120.00 GB
+
+================================================================================
+[6/8] SÍMBOLOS CON DATOS MASIVOS
+================================================================================
+⚠️  WARNING: Se encontraron 15 símbolos con >500 días de datos
+
+Top 10 símbolos más grandes:
+  GOGO  :  758 días,   250.5 MB
+  AAPL  :  720 días,   310.2 MB
+  ...
+
+================================================================================
+RESUMEN DE DIAGNÓSTICO
+================================================================================
+❌ ISSUES CRÍTICOS: 0
+⚠️  WARNINGS: 2
+  - Se encontraron 3 lock files zombies
+  - Se encontraron 15 símbolos con >500 días de datos
+
+✅ VEREDICTO: SAFE TO LAUNCH (con precaución)
+```
+
+**Interpretación:**
+- **0 issues críticos** → ✅ Safe to launch
+- **1-3 warnings** → ⚠️ Revisar pero puede lanzarse
+- **>3 warnings** → ❌ Resolver antes de lanzar
+- **Símbolos masivos** → Considerar procesarlos por separado
+
+---
+
 ## 🛠️ Otros Scripts
 
 ### seed_checkpoint.py
