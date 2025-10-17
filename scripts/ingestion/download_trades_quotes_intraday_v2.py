@@ -36,12 +36,15 @@ import sys
 import os
 import json
 import hashlib
+import uuid
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import argparse
 import time
 from typing import Optional, Dict, List
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import polars as pl
 import yaml
@@ -63,12 +66,103 @@ if env_file.exists():
                 os.environ[key] = value
 
 
+def safe_write_parquet(df: pl.DataFrame, final_path: Path, max_tries: int = 5) -> bool:
+    """
+    Write parquet file with atomic rename and retry logic (anti-WinError 2)
+
+    Args:
+        df: Polars DataFrame to write
+        final_path: Final destination path
+        max_tries: Maximum number of rename attempts
+
+    Returns:
+        True if successful, False otherwise
+    """
+    final_path = Path(final_path)
+
+    # Create unique temp file in same directory (same filesystem)
+    tmp_suffix = f".tmp.{uuid.uuid4().hex[:8]}"
+    tmp_path = final_path.with_suffix(final_path.suffix + tmp_suffix)
+
+    try:
+        # Ensure directory exists
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write to temporary file
+        df.write_parquet(tmp_path, compression="zstd")
+
+        # Atomic rename with retries
+        for attempt in range(max_tries):
+            try:
+                # os.replace is atomic on Windows (unlike Path.replace)
+                os.replace(str(tmp_path), str(final_path))
+                return True
+
+            except FileNotFoundError:
+                # Temp file disappeared (another process moved it?) or directory missing
+                if final_path.exists():
+                    # Final file exists, consider it success
+                    logger.debug(f"Temp file vanished but final exists: {final_path.name}")
+                    return True
+                # Directory might have been deleted, recreate
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                if attempt < max_tries - 1:
+                    time.sleep(0.2 * (attempt + 1))
+
+            except PermissionError:
+                # File handle still open (AV, indexer, or OS delay)
+                if attempt < max_tries - 1:
+                    logger.debug(f"PermissionError on rename, retrying ({attempt+1}/{max_tries})")
+                    time.sleep(0.4 * (attempt + 1))
+                else:
+                    logger.warning(f"PermissionError after {max_tries} attempts: {final_path.name}")
+
+        # All retries failed, cleanup temp file
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except:
+            pass
+
+        return False
+
+    except Exception as e:
+        # Write failed, cleanup
+        logger.error(f"Failed to write parquet: {e}")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except:
+            pass
+        return False
+
+
+class RateLimiter:
+    """Global rate limiter shared across threads"""
+
+    def __init__(self, delay_seconds: float):
+        self.delay = delay_seconds
+        self.lock = threading.Lock()
+        self.last_request_time = 0
+
+    def wait(self):
+        """Wait if necessary to respect rate limit"""
+        with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_request_time
+
+            if time_since_last < self.delay:
+                sleep_time = self.delay - time_since_last
+                time.sleep(sleep_time)
+
+            self.last_request_time = time.time()
+
+
 class CheckpointManager:
-    """Manage download progress checkpoints"""
+    """Manage download progress checkpoints (thread-safe)"""
 
     def __init__(self, checkpoint_file: Path):
         self.checkpoint_file = checkpoint_file
         self.completed_events = set()
+        self.lock = threading.Lock()
         self._load()
 
     def _load(self):
@@ -82,25 +176,28 @@ class CheckpointManager:
             logger.info("No checkpoint found, starting fresh")
 
     def save(self):
-        """Save checkpoint to disk"""
-        self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump({
-                "completed_events": list(self.completed_events),
-                "last_updated": datetime.now().isoformat()
-            }, f, indent=2)
+        """Save checkpoint to disk (thread-safe)"""
+        with self.lock:
+            self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump({
+                    "completed_events": list(self.completed_events),
+                    "last_updated": datetime.now().isoformat()
+                }, f, indent=2)
 
     def mark_completed(self, event_id: str):
-        """Mark event as completed"""
-        self.completed_events.add(event_id)
+        """Mark event as completed (thread-safe)"""
+        with self.lock:
+            self.completed_events.add(event_id)
 
     def is_completed(self, event_id: str) -> bool:
-        """Check if event is already completed"""
-        return event_id in self.completed_events
+        """Check if event is already completed (thread-safe)"""
+        with self.lock:
+            return event_id in self.completed_events
 
 
 class HeartbeatMonitor:
-    """Track and log progress heartbeats"""
+    """Track and log progress heartbeats (thread-safe)"""
 
     def __init__(self, total_events: int, heartbeat_interval: int = 100):
         self.total_events = total_events
@@ -112,23 +209,25 @@ class HeartbeatMonitor:
         self.total_quotes = 0
         self.total_size_mb = 0.0
         self.start_time = time.time()
+        self.lock = threading.Lock()
 
     def update(self, trades_count: int, quotes_count: int, size_mb: float, success: bool, skipped: bool = False):
-        """Update stats"""
-        if skipped:
-            self.skipped += 1
-        elif success:
-            self.processed += 1
-            self.total_trades += trades_count
-            self.total_quotes += quotes_count
-            self.total_size_mb += size_mb
-        else:
-            self.failed += 1
+        """Update stats (thread-safe)"""
+        with self.lock:
+            if skipped:
+                self.skipped += 1
+            elif success:
+                self.processed += 1
+                self.total_trades += trades_count
+                self.total_quotes += quotes_count
+                self.total_size_mb += size_mb
+            else:
+                self.failed += 1
 
-        # Heartbeat every N events
-        total_done = self.processed + self.failed + self.skipped
-        if total_done > 0 and total_done % self.heartbeat_interval == 0:
-            self._log_heartbeat()
+            # Heartbeat every N events
+            total_done = self.processed + self.failed + self.skipped
+            if total_done > 0 and total_done % self.heartbeat_interval == 0:
+                self._log_heartbeat()
 
     def _log_heartbeat(self):
         """Log heartbeat stats"""
@@ -171,6 +270,43 @@ class HeartbeatMonitor:
         logger.info(f"Time elapsed: {elapsed/3600:.2f} hours ({elapsed/3600/24:.2f} days)")
         logger.info(f"Rate: {total_done/(elapsed/3600):.1f} events/hour")
         logger.info("="*80)
+
+
+def generate_canonical_event_id(event_row: Dict) -> str:
+    """
+    Generate canonical event ID with normalized UTC timestamp and hash.
+
+    This ID is used both for:
+    - Checkpoint tracking (resume)
+    - File/directory naming
+
+    Format: {symbol}_{event_type}_{YYYYMMDD_HHMMSS}_{hash8}
+    """
+    symbol = event_row["symbol"]
+    event_type = event_row["event_type"]
+    raw_timestamp = event_row["timestamp"]
+
+    # Normalize timestamp to UTC
+    if isinstance(raw_timestamp, str):
+        try:
+            event_ts = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        except Exception:
+            event_ts = datetime.strptime(raw_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    else:
+        event_ts = raw_timestamp
+        if event_ts.tzinfo is None:
+            event_ts = event_ts.replace(tzinfo=timezone.utc)
+
+    event_ts_utc = event_ts.astimezone(timezone.utc)
+
+    # Generate stable hash
+    id_seed = f"{symbol}|{event_type}|{event_ts_utc.isoformat()}".encode()
+    id_hash = hashlib.sha1(id_seed).hexdigest()[:8]
+
+    # Canonical ID
+    event_id = f"{symbol}_{event_type}_{event_ts_utc.strftime('%Y%m%d_%H%M%S')}_{id_hash}"
+
+    return event_id
 
 
 class PolygonTradesQuotesDownloader:
@@ -488,7 +624,8 @@ class PolygonTradesQuotesDownloader:
         download_trades: bool = True,
         download_quotes: bool = True,
         resume: bool = False,
-        budget_mb: Optional[float] = None
+        budget_mb: Optional[float] = None,
+        rate_limiter: Optional['RateLimiter'] = None
     ) -> Dict:
         """
         Download trades+quotes for single event
@@ -509,29 +646,25 @@ class PolygonTradesQuotesDownloader:
         event_type = event_row["event_type"]
         session = event_row.get("session", "RTH")
 
-        # --- PATCH 1: Stable UTC timestamp for IDs / windows ---
+        # --- PATCH 1: Canonical event ID (shared with checkpoint) ---
+        event_id = generate_canonical_event_id(event_row)
+
+        # --- PATCH 2: Stable UTC timestamp for windows ---
         if isinstance(raw_timestamp, str):
-            # Parse ISO8601 with/without timezone
             try:
                 event_ts = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
             except Exception:
                 event_ts = datetime.strptime(raw_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         else:
-            # polars Datetime -> python datetime (usually already in UTC)
             event_ts = raw_timestamp
             if event_ts.tzinfo is None:
                 event_ts = event_ts.replace(tzinfo=timezone.utc)
 
         event_ts_utc = event_ts.astimezone(timezone.utc)
 
-        # --- PATCH 2: Per-row windows from manifest (fallback to defaults) ---
+        # --- PATCH 3: Per-row windows from manifest (fallback to defaults) ---
         window_before = int(event_row.get("window_before_min", self.window_before_minutes))
         window_after = int(event_row.get("window_after_min", self.window_after_minutes))
-
-        # --- PATCH 3: Stable event ID with hash ---
-        id_seed = f"{symbol}|{event_type}|{event_ts_utc.isoformat()}".encode()
-        id_hash = hashlib.sha1(id_seed).hexdigest()[:8]
-        event_id = f"{symbol}_{event_type}_{event_ts_utc.strftime('%Y%m%d_%H%M%S')}_{id_hash}"
 
         # Output paths
         symbol_dir = output_dir / f"symbol={symbol}"
@@ -587,22 +720,24 @@ class PolygonTradesQuotesDownloader:
             if df_trades is not None and not self.dry_run:
                 event_dir.mkdir(parents=True, exist_ok=True)
 
-                # --- PATCH 5: Atomic writes ---
-                tmp_trades = trades_file.with_suffix(".parquet.tmp")
+                # --- PATCH 5: Atomic writes with anti-WinError retry ---
                 if len(df_trades) > 0:
-                    df_trades.write_parquet(tmp_trades, compression="zstd")
-                    tmp_trades.replace(trades_file)
-                    stats["trades_count"] = len(df_trades)
-
-                    if trades_file.exists():
-                        stats["size_mb"] += trades_file.stat().st_size / 1024 / 1024
-
-                    logger.info(f"{symbol} {event_id}: Saved {len(df_trades)} trades")
+                    success = safe_write_parquet(df_trades, trades_file)
+                    if success:
+                        stats["trades_count"] = len(df_trades)
+                        if trades_file.exists():
+                            stats["size_mb"] += trades_file.stat().st_size / 1024 / 1024
+                        logger.info(f"{symbol} {event_id}: Saved {len(df_trades)} trades")
+                    else:
+                        logger.warning(f"{symbol} {event_id}: Failed to finalize trades file (will retry on resume)")
                 else:
                     logger.info(f"{symbol} {event_id}: 0 trades (no file written)")
 
             if not self.dry_run:
-                time.sleep(self.rate_limit_delay)
+                if rate_limiter:
+                    rate_limiter.wait()
+                else:
+                    time.sleep(self.rate_limit_delay)
 
         # Download quotes
         if download_quotes:
@@ -634,22 +769,24 @@ class PolygonTradesQuotesDownloader:
 
                 event_dir.mkdir(parents=True, exist_ok=True)
 
-                # --- PATCH 5: Atomic writes ---
-                tmp_quotes = quotes_file.with_suffix(".parquet.tmp")
+                # --- PATCH 5: Atomic writes with anti-WinError retry ---
                 if len(df_quotes) > 0:
-                    df_quotes.write_parquet(tmp_quotes, compression="zstd")
-                    tmp_quotes.replace(quotes_file)
-                    stats["quotes_count"] = len(df_quotes)
-
-                    if quotes_file.exists():
-                        stats["size_mb"] += quotes_file.stat().st_size / 1024 / 1024
-
-                    logger.info(f"{symbol} {event_id}: Saved {len(df_quotes)} quotes")
+                    success = safe_write_parquet(df_quotes, quotes_file)
+                    if success:
+                        stats["quotes_count"] = len(df_quotes)
+                        if quotes_file.exists():
+                            stats["size_mb"] += quotes_file.stat().st_size / 1024 / 1024
+                        logger.info(f"{symbol} {event_id}: Saved {len(df_quotes)} quotes")
+                    else:
+                        logger.warning(f"{symbol} {event_id}: Failed to finalize quotes file (will retry on resume)")
                 else:
                     logger.info(f"{symbol} {event_id}: 0 quotes (no file written)")
 
             if not self.dry_run:
-                time.sleep(self.rate_limit_delay)
+                if rate_limiter:
+                    rate_limiter.wait()
+                else:
+                    time.sleep(self.rate_limit_delay)
 
         # Budget cut logic
         if budget_mb and stats["size_mb"] > budget_mb:
@@ -788,46 +925,95 @@ def main():
     # Heartbeat monitor
     monitor = HeartbeatMonitor(len(df_manifest), heartbeat_interval=100)
 
-    # Process events
+    # Global rate limiter (shared across workers)
+    rate_limiter = RateLimiter(args.rate_limit)
+
+    # Worker function for parallel execution
+    def process_event(event_tuple):
+        """Process single event (worker function)"""
+        i, event_row = event_tuple
+
+        # Use canonical event ID (same as file naming)
+        event_id = generate_canonical_event_id(event_row)
+
+        # Skip if completed
+        if checkpoint and checkpoint.is_completed(event_id):
+            logger.debug(f"[{i+1}/{len(df_manifest)}] Skipping {event_id} (already completed)")
+            return {'skipped': True, 'index': i, 'event_id': event_id, 'stats': {'trades_count': 0, 'quotes_count': 0, 'size_mb': 0.0}}
+
+        logger.info(f"\n[{i+1}/{len(df_manifest)}] {event_row['symbol']} {event_row['event_type']} @ {event_row['timestamp']} ({event_row.get('session', 'RTH')})")
+
+        try:
+            stats = downloader.download_event_window(
+                event_row,
+                output_dir,
+                download_trades=download_trades,
+                download_quotes=download_quotes,
+                resume=args.resume,
+                rate_limiter=rate_limiter  # Pass global rate limiter
+            )
+            return {'success': True, 'index': i, 'event_id': event_id, 'stats': stats}
+
+        except Exception as e:
+            logger.error(f"Failed to process event {event_id}: {e}")
+            return {'success': False, 'index': i, 'event_id': event_id, 'error': str(e)}
+
+    # Process events (parallel or sequential)
     try:
-        for i, event_row in enumerate(df_manifest.iter_rows(named=True)):
-            event_id = f"{event_row['symbol']}_{event_row['event_type']}_{event_row['timestamp']}"
+        events_list = list(enumerate(df_manifest.iter_rows(named=True)))
+        events_processed = 0
 
-            # Skip if completed
-            if checkpoint and checkpoint.is_completed(event_id):
-                logger.debug(f"[{i+1}/{len(df_manifest)}] Skipping {event_id} (already completed)")
-                monitor.update(0, 0, 0.0, True, skipped=True)
-                continue
+        if args.workers > 1:
+            # Parallel processing with ThreadPoolExecutor
+            logger.info(f"Using {args.workers} parallel workers")
 
-            logger.info(f"\n[{i+1}/{len(df_manifest)}] {event_row['symbol']} {event_row['event_type']} @ {event_row['timestamp']} ({event_row.get('session', 'RTH')})")
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                # Submit all tasks
+                future_to_event = {executor.submit(process_event, event): event for event in events_list}
 
-            try:
-                stats = downloader.download_event_window(
-                    event_row,
-                    output_dir,
-                    download_trades=download_trades,
-                    download_quotes=download_quotes,
-                    resume=args.resume  # Pass resume flag to enable partial resume
-                )
+                # Process completed futures
+                for future in as_completed(future_to_event):
+                    result = future.result()
+                    events_processed += 1
 
-                if stats.get("skipped"):
-                    monitor.update(stats["trades_count"], stats["quotes_count"], stats["size_mb"], True, skipped=True)
-                elif stats["success"]:
-                    monitor.update(stats["trades_count"], stats["quotes_count"], stats["size_mb"], True)
+                    if result.get('skipped'):
+                        monitor.update(0, 0, 0.0, True, skipped=True)
+                    elif result.get('success'):
+                        stats = result['stats']
+                        monitor.update(stats['trades_count'], stats['quotes_count'], stats['size_mb'], True)
+
+                        # Mark as completed in checkpoint
+                        if checkpoint:
+                            checkpoint.mark_completed(result['event_id'])
+
+                            # Save checkpoint every 100 events
+                            if events_processed % 100 == 0:
+                                checkpoint.save()
+                    else:
+                        monitor.update(0, 0, 0.0, False)
+
+        else:
+            # Sequential processing (original behavior)
+            logger.info("Using sequential processing (1 worker)")
+            for event in events_list:
+                result = process_event(event)
+                events_processed += 1
+
+                if result.get('skipped'):
+                    monitor.update(0, 0, 0.0, True, skipped=True)
+                elif result.get('success'):
+                    stats = result['stats']
+                    monitor.update(stats['trades_count'], stats['quotes_count'], stats['size_mb'], True)
 
                     # Mark as completed in checkpoint
                     if checkpoint:
-                        checkpoint.mark_completed(event_id)
+                        checkpoint.mark_completed(result['event_id'])
 
                         # Save checkpoint every 100 events
-                        if (i + 1) % 100 == 0:
+                        if events_processed % 100 == 0:
                             checkpoint.save()
                 else:
                     monitor.update(0, 0, 0.0, False)
-
-            except Exception as e:
-                logger.error(f"Failed to process event: {e}")
-                monitor.update(0, 0, 0.0, False)
 
     finally:
         # Final checkpoint save

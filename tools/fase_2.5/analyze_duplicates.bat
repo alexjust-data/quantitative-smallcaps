@@ -2,6 +2,15 @@
 REM ================================================================================
 REM FASE 2.5 - Duplicate Analysis Wrapper (Windows)
 REM ================================================================================
+REM
+REM Usage:
+REM   analyze_duplicates.bat                    - Full analysis
+REM   analyze_duplicates.bat --heartbeat-only   - Quick check (heartbeat only)
+REM   analyze_duplicates.bat --detailed         - Detailed shard-by-shard
+REM   analyze_duplicates.bat --export-csv       - Export results to CSV
+REM   analyze_duplicates.bat --tail 1000        - Analyze last 1000 heartbeat lines
+REM
+REM ================================================================================
 
 echo.
 echo ================================================================================

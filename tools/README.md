@@ -1,260 +1,223 @@
-# Tools - FASE 2.5 Monitoring & Analysis
+# Tools - FASE 2.5 Utilities
 
-## 📊 Scripts de Auditoría
+## ⭐ NUEVO: Análisis de Datos y Duplicados (RECOMENDADO)
 
-### audit_system.sh / audit_system.bat
-**Audita el progreso de FASE 2.5 con cálculo CORRECTO de símbolos completados**
+**Usar PowerShell/CMD Nativo (RECOMENDADO)**
 
-Este script ha sido corregido para:
-- ✅ Mergear TODOS los checkpoints recientes (últimos 7 días)
-- ✅ Calcular correctamente símbolos únicos completados
-- ✅ Mostrar progreso real (no solo el último checkpoint)
-- ✅ Detectar automáticamente heartbeat y logs más recientes
+Abre PowerShell o CMD fuera de VS Code y ejecuta:
 
-**Uso:**
+```sh
+cd D:\04_TRADING_SMALLCAPS
+.\tools\analyze_data_duplicates.bat
 
-Desde CMD/PowerShell:
-```cmd
-cd D:\04_TRADING_SMALLCAPS\tools
-audit_system.bat
-```
+Verás el progreso en tiempo real sin problemas:
 
-Desde Git Bash:
+Procesados 50 shards...
+Procesados 100 shards...
+Procesados 150 shards...
+...
+
+### Análisis Completo 100% Verificable
 ```bash
-cd /d/04_TRADING_SMALLCAPS/tools
-./audit_system.sh
+# Windows
+tools\analyze_data_duplicates.bat
+
+# Linux/Mac
+./tools/analyze_data_duplicates.sh
 ```
 
-**Output esperado:**
+**Uso:** Análisis definitivo que muestra DATOS REALES en disco
+**Tiempo:** ~30-60 segundos
+**Output:**
+- **Escaneo físico de shards** (símbolos únicos reales)
+- **Eventos totales guardados** (100% verificado)
+- **Duplicados en shards** (análisis por run)
+- **Checkpoints vs Realidad** (discrepancias)
+- **Heartbeat en tiempo real** (procesamiento activo)
+
+**Este es el análisis que debes usar** para saber exactamente qué datos tienes.
+
+### Quick Mode (sin heartbeat)
+```bash
+python tools/analyze_data_duplicates.py --quick
 ```
-================================================================================
-AUDITORIA DEL SISTEMA FASE 2.5
-================================================================================
+Más rápido, solo datos físicos y checkpoints.
 
-[2/5] CHECKPOINT - PROGRESO REAL (CORREGIDO)
---------------------------------------------------------------------------------
-Merging all recent checkpoints (last 7 days)...
+---
 
-Checkpoint files found: 4
-  - events_intraday_20251012_completed.json: 809 symbols (2025-10-12)
-  - events_intraday_20251013_completed.json: 45 symbols (2025-10-13)
-  - events_intraday_20251014_completed.json: 1016 symbols (2025-10-14)
-  - events_intraday_20251015_completed.json: 1870 symbols (2025-10-15)
+## Análisis de Duplicados (Legacy)
 
-============================================================
-PROGRESO REAL (merged from all checkpoints):
-============================================================
-Total symbols: 1996
-Completed: 1870
-Remaining: 126
-Progress: 93.7%
-============================================================
+### Quick Check (Rápido - Solo Heartbeat)
+```bash
+# Windows
+tools\quick_check.bat
+
+# Linux/Mac
+python tools/analyze_duplicates.py --heartbeat-only
+```
+
+**Uso:** Análisis rápido del heartbeat log para detectar duplicados en tiempo real.
+**Tiempo:** ~1 segundo
+**Output:** 
+- Progreso actual (checkpoint)
+- Tasa de duplicación en últimas 500 entradas
+- Top símbolos duplicados
+
+---
+
+### Análisis Completo
+```bash
+# Windows
+tools\analyze_duplicates.bat
+
+# Linux/Mac
+python tools/analyze_duplicates.py
+```
+
+**Uso:** Análisis completo de:
+1. Heartbeat log (procesamiento en tiempo real)
+2. Checkpoint actual (progreso persistido)
+3. Shards individuales (últimos 7 días)
+4. Archivo merged (si existe)
+5. Comparación checkpoint vs shards
+
+**Tiempo:** ~30-60 segundos (depende de cantidad de shards)
+
+---
+
+### Opciones Avanzadas
+
+#### Análisis detallado por shard
+```bash
+python tools/analyze_duplicates.py --detailed
+```
+
+#### Exportar a CSV
+```bash
+python tools/analyze_duplicates.py --export-csv
+```
+
+#### Analizar más líneas del heartbeat
+```bash
+python tools/analyze_duplicates.py --heartbeat-only --tail 1000
+```
+
+#### Solo merge (sin análisis)
+```bash
+python tools/analyze_duplicates.py --merge-only
 ```
 
 ---
 
-## 🔍 Scripts de Análisis de Duplicados
+## Output Ejemplo
 
-### analyze_duplicates.py / .sh / .bat
-**Analiza duplicados en eventos de FASE 2.5 a múltiples niveles**
-
-Características:
-- ✅ Analiza todos los shards individuales (últimos 7 días)
-- ✅ Analiza archivo merged final
-- ✅ Compara checkpoints vs shards
-- ✅ Identifica símbolos con duplicados
-- ✅ Genera reportes detallados
-- ✅ Opción para exportar CSV
-
-**Uso básico:**
-
-Desde CMD/PowerShell:
-```cmd
-cd D:\04_TRADING_SMALLCAPS\tools
-analyze_duplicates.bat
-```
-
-Desde Git Bash:
-```bash
-cd /d/04_TRADING_SMALLCAPS/tools
-./analyze_duplicates.sh
-```
-
-**Opciones avanzadas:**
-
-```bash
-# Análisis detallado
-./analyze_duplicates.sh --detailed
-
-# Exportar resultados a CSV
-./analyze_duplicates.sh --export-csv
-
-# Solo mergear shards (sin análisis)
-./analyze_duplicates.sh --merge-only
-```
-
-**Output esperado:**
-
+### Quick Check
 ```
 ================================================================================
-ANALYZING SHARDS (last 7 days)
+HEARTBEAT ANALYSIS RESULTS
 ================================================================================
-Found 437 shards to analyze...
-✓ Analyzed 437 shards
+Total entries analyzed: 500
+Unique symbols: 388
+Symbols with duplicates: 112
+Total duplicate entries: 165
+Duplication rate: 9.30%
 
-Total shards analyzed: 437
-Total events: 1,539,419
-Unique events: 1,539,419
-Duplicates: 0
-Average dup rate: 0.00%
+Status: ✓ GOOD
 
-✓ No duplicates found in any shard!
-
-================================================================================
-ANALYZING MERGED FILE
-================================================================================
-File: events_intraday_20251013.parquet
-Total events: 720,663
-Unique events: 372,204
-Duplicates: 348,459
-Duplication rate: 48.35%
-Status: ✗ CRITICAL
-
-Top 10 symbols by duplicate count:
-  OPEN  : 7,464 duplicate events
-  PLUG  : 6,708 duplicate events
-  AAOI  : 6,174 duplicate events
+Top 20 symbols with most duplications:
+  REKR    :  5 times (duplicated 4 times)
+  RVYL    :  3 times (duplicated 2 times)
+  QUIK    :  3 times (duplicated 2 times)
   ...
 
 ================================================================================
-COMPARING CHECKPOINTS VS SHARDS
+PROGRESS SUMMARY
 ================================================================================
-Checkpoint symbols: 1874
-Shard symbols: 1517
-Discrepancy: 357
+Total symbols in universe: 1,996
+Completed: 1,765 (88.4%)
+Remaining: 231
 
-⚠ WARNING: 357 symbols marked complete but no shards found!
-```
-
-**Interpretación de resultados:**
-
-- **Shard-level duplicates: 0%** → ✅ Shards actuales son limpios
-- **Merged file duplicates: 48%** → ❌ Archivo viejo con duplicados (del 13/10)
-- **Checkpoint vs Shards discrepancy: 357** → ⚠️ Símbolos sin shards (posiblemente sin eventos)
-
----
-
-## 🔬 Script de Diagnóstico Pre-Lanzamiento
-
-### pre_launch_diagnostics.py / .sh / .bat
-**Diagnóstico completo del sistema ANTES de lanzar workers**
-
-Detecta problemas que pueden causar cuelgues:
-- ✅ Memoria disponible
-- ✅ Espacio en disco
-- ✅ Locks zombies
-- ✅ Procesos activos
-- ✅ Heartbeat congelado
-- ✅ Símbolos con datos masivos (>500 días)
-- ✅ Shards recientes
-- ✅ Consistencia de checkpoints
-
-**Uso básico:**
-
-Desde CMD/PowerShell:
-```cmd
-cd D:\04_TRADING_SMALLCAPS\tools
-pre_launch_diagnostics.bat
-```
-
-Desde Git Bash:
-```bash
-cd /d/04_TRADING_SMALLCAPS/tools
-./pre_launch_diagnostics.sh
-```
-
-**Opciones avanzadas:**
-
-```bash
-# Diagnóstico detallado
-./pre_launch_diagnostics.sh --detailed
-
-# Auto-eliminar locks zombies
-./pre_launch_diagnostics.sh --fix-locks
-```
-
-**Output esperado:**
-
-```
-================================================================================
-[1/8] MEMORIA DISPONIBLE
-================================================================================
-Total RAM: 16.00 GB
-Available: 8.50 GB (53.1%)
-✓ INFO: Memoria suficiente: 8.50 GB
-
-================================================================================
-[2/8] ESPACIO EN DISCO
-================================================================================
-Total disk: 500.00 GB
-Available: 120.00 GB (24.0%)
-✓ INFO: Espacio suficiente: 120.00 GB
-
-================================================================================
-[6/8] SÍMBOLOS CON DATOS MASIVOS
-================================================================================
-⚠️  WARNING: Se encontraron 15 símbolos con >500 días de datos
-
-Top 10 símbolos más grandes:
-  GOGO  :  758 días,   250.5 MB
-  AAPL  :  720 días,   310.2 MB
-  ...
-
-================================================================================
-RESUMEN DE DIAGNÓSTICO
-================================================================================
-❌ ISSUES CRÍTICOS: 0
-⚠️  WARNINGS: 2
-  - Se encontraron 3 lock files zombies
-  - Se encontraron 15 símbolos con >500 días de datos
-
-✅ VEREDICTO: SAFE TO LAUNCH (con precaución)
-```
-
-**Interpretación:**
-- **0 issues críticos** → ✅ Safe to launch
-- **1-3 warnings** → ⚠️ Revisar pero puede lanzarse
-- **>3 warnings** → ❌ Resolver antes de lanzar
-- **Símbolos masivos** → Considerar procesarlos por separado
-
----
-
-## 🛠️ Otros Scripts
-
-### seed_checkpoint.py
-**Inicializa o corrige checkpoints manualmente**
-
-Uso:
-```bash
-python tools/seed_checkpoint.py --symbols processed/symbols_list.txt
+Progress: [████████████████████████████████████████████░░░░░] 88.4%
 ```
 
 ---
 
-## 📝 Notas Importantes
+## Interpretación de Resultados
 
-### Auditoría de Progreso
-- Los scripts de auditoría manejan correctamente ejecuciones con múltiples workers paralelos
-- El progreso se calcula haciendo SET UNION de todos los símbolos en checkpoints recientes
-- Si un símbolo aparece en múltiples checkpoints, solo se cuenta una vez
+### Tasa de Duplicación
 
-### Análisis de Duplicados
-- Los shards NUEVOS (post-fix 14/10) tienen 0% duplicación ✅
-- El archivo `events_intraday_20251013.parquet` tiene 48% duplicación (pre-fix) ❌
-- Use `--merge-only` para crear un nuevo archivo merged limpio desde shards actuales
-- El análisis toma ~2-3 minutos para 437 shards
+| Tasa | Status | Acción |
+|------|--------|--------|
+| < 5% | ✓ EXCELLENT | Sistema funcionando perfectamente |
+| 5-10% | ✓ GOOD | Duplicación aceptable (debido a crashes/relaunches) |
+| 10-20% | ⚠ WARNING | Revisar watchdog y workers |
+| > 20% | ✗ CRITICAL | Problema grave - detener y revisar |
 
-### Requisitos
-- Python 3.8+
-- polars (`pip install polars`)
-- 2-4 GB RAM disponibles para análisis completo
+### Causas Comunes de Duplicación
+
+1. **Workers crashean durante procesamiento** (0.5-10%)
+   - Normal con ACCESS_VIOLATION errors
+   - Watchdog relanza → símbolo se reprocesa
+   - Deduplicación final lo resuelve
+
+2. **Falta de checkpoint compartido** (50-75%)
+   - Workers no usan checkpoint
+   - Cada worker procesa todos los símbolos
+   - **Solución:** Usar `launch_parallel_detection.py --resume`
+
+3. **Race condition en shard numbering** (<1%)
+   - File locks fallan
+   - Dos workers escriben mismo shard
+   - **Solución:** Ya implementado en detector
+
+---
+
+## Notas
+
+- El análisis del heartbeat muestra duplicación **en tiempo real** (puede ser diferente del archivo final)
+- Los duplicados son **copias idénticas** - deduplicación los elimina sin pérdida
+- Duplicación < 10% es **aceptable** con watchdog auto-recovery
+- Para análisis histórico, usar análisis completo (no solo heartbeat)
+
+---
+
+## Troubleshooting
+
+### "No heartbeat log found"
+- El proceso no ha iniciado hoy
+- Buscar log de días anteriores: `logs/detect_events/heartbeat_*.log`
+
+### "No checkpoint found"
+- Primera ejecución del día
+- Checkpoint se crea al completar primer símbolo
+
+### "Polars not installed"
+```bash
+pip install polars
+```
+
+---
+
+**Última actualización:** 2025-10-16
+
+# Seguimos para restaurar el proceso Fase_2.5
+
+**1️⃣ Limpieza (SIEMPRE primero)**
+
+```sh
+cd D:\04_TRADING_SMALLCAPS
+python scripts/processing/restart_parallel.py
+```
+
+**2️⃣ Seedear Checkpoint (RECOMENDADO - evita duplicación)**
+
+```sh
+# Esto marca los 1,517 símbolos ya procesados como "completados"
+python tools/seed_checkpoint.py events_intraday_20251012 events_intraday_20251016
+python tools/seed_checkpoint.py events_intraday_20251013 events_intraday_20251016  
+python tools/seed_checkpoint.py events_intraday_20251014 events_intraday_20251016
+```
+
+**3️⃣ Lanzar con Watchdog (Auto-recovery)**
+
+python tools/watchdog_parallel.py

@@ -4,14 +4,16 @@
 FASE 2.5 - Duplicate Events Analysis Tool
 
 Analiza duplicados en eventos de FASE 2.5 a múltiples niveles:
-1. Shards individuales
-2. Archivo merged final
-3. Comparación entre checkpoints y shards
-4. Identificación de símbolos con duplicados
+1. Heartbeat log (símbolos procesados en tiempo real)
+2. Checkpoint actual (progreso persistido)
+3. Shards individuales
+4. Archivo merged final
+5. Comparación entre checkpoints y shards
 
 Uso:
     python tools/analyze_duplicates.py
     python tools/analyze_duplicates.py --detailed
+    python tools/analyze_duplicates.py --heartbeat-only
     python tools/analyze_duplicates.py --export-csv
 """
 
@@ -21,6 +23,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import json
 import argparse
+import re
+from collections import Counter
 
 # Fix Windows console encoding
 if sys.platform == "win32":
@@ -47,6 +51,191 @@ class DuplicateAnalyzer:
         self.shards_dir = self.project_root / "processed" / "events" / "shards"
         self.events_dir = self.project_root / "processed" / "events"
         self.checkpoint_dir = self.project_root / "logs" / "checkpoints"
+        self.heartbeat_dir = self.project_root / "logs" / "detect_events"
+
+    def analyze_heartbeat_log(self, tail_lines: int = 500) -> dict:
+        """Analyze heartbeat log for duplicate symbol processing"""
+        print(f"\n{'='*80}")
+        print(f"ANALYZING HEARTBEAT LOG (Real-time Processing)")
+        print(f"{'='*80}\n")
+
+        # Find most recent heartbeat log
+        today = datetime.now().strftime("%Y%m%d")
+        heartbeat_file = self.heartbeat_dir / f"heartbeat_{today}.log"
+
+        if not heartbeat_file.exists():
+            # Try to find any recent heartbeat file
+            candidates = sorted(self.heartbeat_dir.glob("heartbeat_*.log"), reverse=True)
+            if candidates:
+                heartbeat_file = candidates[0]
+            else:
+                print(f"ERROR: No heartbeat log found in {self.heartbeat_dir}")
+                return {}
+
+        print(f"Heartbeat file: {heartbeat_file.name}")
+        print(f"Analyzing last {tail_lines} entries...\n")
+
+        try:
+            # Read last N lines efficiently
+            with open(heartbeat_file, 'r', encoding='utf-8') as f:
+                # Seek to end and read backwards
+                f.seek(0, 2)  # End of file
+                file_size = f.tell()
+
+                # Read in chunks from the end
+                block_size = 8192
+                blocks = []
+                lines_found = 0
+
+                while file_size > 0 and lines_found < tail_lines:
+                    read_size = min(block_size, file_size)
+                    f.seek(file_size - read_size)
+                    block = f.read(read_size)
+                    blocks.append(block)
+                    lines_found += block.count('\n')
+                    file_size -= read_size
+
+                # Reconstruct and parse
+                content = ''.join(reversed(blocks))
+                lines = content.splitlines()[-tail_lines:]
+
+            # Parse symbols (format: YYYY-MM-DD HH:MM:SS.mmm    SYMBOL    ...)
+            symbols = []
+            for line in lines:
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 3:
+                    # Third column is the symbol
+                    symbol = parts[2]
+                    symbols.append(symbol)
+
+            # Count duplicates
+            symbol_counts = Counter(symbols)
+            total_symbols = len(symbols)
+            unique_symbols = len(symbol_counts)
+            duplicated_symbols = {sym: count for sym, count in symbol_counts.items() if count > 1}
+            total_duplications = sum(count - 1 for count in duplicated_symbols.values())
+
+            # Calculate duplication rate
+            dup_rate = (total_duplications / total_symbols * 100) if total_symbols > 0 else 0
+
+            print(f"{'='*80}")
+            print(f"HEARTBEAT ANALYSIS RESULTS")
+            print(f"{'='*80}")
+            print(f"Total entries analyzed: {total_symbols:,}")
+            print(f"Unique symbols: {unique_symbols:,}")
+            print(f"Symbols with duplicates: {len(duplicated_symbols):,}")
+            print(f"Total duplicate entries: {total_duplications:,}")
+            print(f"Duplication rate: {dup_rate:.2f}%")
+            print()
+
+            # Status
+            if dup_rate < 5:
+                status = "✓ EXCELLENT"
+            elif dup_rate < 10:
+                status = "✓ GOOD"
+            elif dup_rate < 20:
+                status = "⚠ WARNING"
+            else:
+                status = "✗ CRITICAL"
+
+            print(f"Status: {status}")
+            print()
+
+            # Show top duplicated symbols
+            if duplicated_symbols:
+                top_dups = sorted(duplicated_symbols.items(), key=lambda x: x[1], reverse=True)[:20]
+                print(f"Top 20 symbols with most duplications:")
+                for symbol, count in top_dups:
+                    print(f"  {symbol:8s}: {count:2d} times (duplicated {count-1} times)")
+                print()
+
+            return {
+                "heartbeat_file": heartbeat_file.name,
+                "total_entries": total_symbols,
+                "unique_symbols": unique_symbols,
+                "duplicated_symbols": len(duplicated_symbols),
+                "total_duplications": total_duplications,
+                "dup_rate_pct": dup_rate,
+                "status": status,
+                "top_duplicates": top_dups[:10] if duplicated_symbols else []
+            }
+
+        except Exception as e:
+            print(f"ERROR analyzing heartbeat: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def analyze_current_checkpoint(self) -> dict:
+        """Analyze current checkpoint progress"""
+        print(f"\n{'='*80}")
+        print(f"ANALYZING CURRENT CHECKPOINT")
+        print(f"{'='*80}\n")
+
+        # Find today's checkpoint
+        today = datetime.now().strftime("%Y%m%d")
+        checkpoint_file = self.checkpoint_dir / f"events_intraday_{today}_completed.json"
+
+        if not checkpoint_file.exists():
+            # Try to find most recent checkpoint
+            candidates = sorted(self.checkpoint_dir.glob("events_intraday_*_completed.json"), reverse=True)
+            if candidates:
+                checkpoint_file = candidates[0]
+            else:
+                print(f"ERROR: No checkpoint found in {self.checkpoint_dir}")
+                return {}
+
+        print(f"Checkpoint file: {checkpoint_file.name}")
+
+        try:
+            data = json.load(open(checkpoint_file, encoding='utf-8'))
+
+            total_completed = data.get("total_completed", 0)
+            run_id = data.get("run_id", "unknown")
+            last_updated = data.get("last_updated", "unknown")
+            completed_symbols = data.get("completed_symbols", [])
+
+            print(f"Run ID: {run_id}")
+            print(f"Last updated: {last_updated}")
+            print(f"Total completed: {total_completed:,}")
+            print(f"Symbols in checkpoint: {len(completed_symbols):,}")
+            print()
+
+            # Calculate progress (assuming 1,996 total symbols from FASE 2.5)
+            total_symbols = 1996
+            progress_pct = (total_completed / total_symbols * 100) if total_symbols > 0 else 0
+            remaining = total_symbols - total_completed
+
+            print(f"{'='*80}")
+            print(f"PROGRESS SUMMARY")
+            print(f"{'='*80}")
+            print(f"Total symbols in universe: {total_symbols:,}")
+            print(f"Completed: {total_completed:,} ({progress_pct:.1f}%)")
+            print(f"Remaining: {remaining:,}")
+            print()
+
+            # Progress bar
+            bar_width = 50
+            filled = int(bar_width * progress_pct / 100)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            print(f"Progress: [{bar}] {progress_pct:.1f}%")
+            print()
+
+            return {
+                "checkpoint_file": checkpoint_file.name,
+                "run_id": run_id,
+                "last_updated": last_updated,
+                "total_completed": total_completed,
+                "total_symbols": total_symbols,
+                "progress_pct": progress_pct,
+                "remaining": remaining
+            }
+
+        except Exception as e:
+            print(f"ERROR analyzing checkpoint: {e}")
+            return {"error": str(e)}
 
     def find_recent_shards(self, days: int = 7) -> list[Path]:
         """Find all shards from last N days"""
@@ -365,7 +554,7 @@ class DuplicateAnalyzer:
             "shard_only": len(in_shard_not_checkpoint)
         }
 
-    def run_full_analysis(self, detailed: bool = False, export_csv: bool = False):
+    def run_full_analysis(self, detailed: bool = False, export_csv: bool = False, heartbeat_only: bool = False):
         """Run complete duplicate analysis"""
         print(f"\n{'='*80}")
         print(f"FASE 2.5 - DUPLICATE EVENTS ANALYSIS")
@@ -375,6 +564,20 @@ class DuplicateAnalyzer:
         print(f"{'='*80}\n")
 
         results = {}
+
+        # 0. Analyze heartbeat log (real-time processing)
+        heartbeat_analysis = self.analyze_heartbeat_log(tail_lines=500)
+        results["heartbeat_analysis"] = heartbeat_analysis
+
+        # 0.5. Analyze current checkpoint
+        checkpoint_analysis = self.analyze_current_checkpoint()
+        results["checkpoint_analysis"] = checkpoint_analysis
+
+        if heartbeat_only:
+            print(f"\n{'='*80}")
+            print(f"HEARTBEAT-ONLY ANALYSIS COMPLETE")
+            print(f"{'='*80}\n")
+            return results
 
         # 1. Analyze shards
         shard_analysis = self.analyze_all_shards(days=7)
@@ -394,11 +597,7 @@ class DuplicateAnalyzer:
             merged_analysis = self.analyze_merged_file(latest_merged)
             results["merged_analysis"] = merged_analysis
         else:
-            print("No merged file found. Merging shards...")
-            merged_file = self.merge_all_shards()
-            if merged_file:
-                merged_analysis = self.analyze_merged_file(merged_file)
-                results["merged_analysis"] = merged_analysis
+            print("No merged file found. Skipping merged analysis...")
 
         # 3. Compare checkpoints vs shards
         comparison = self.compare_checkpoints_vs_shards()
@@ -409,19 +608,38 @@ class DuplicateAnalyzer:
         print(f"FINAL SUMMARY")
         print(f"{'='*80}")
 
+        # Heartbeat summary
+        if heartbeat_analysis and "error" not in heartbeat_analysis:
+            print(f"\n📊 Real-time Processing (Heartbeat):")
+            print(f"  Total entries analyzed: {heartbeat_analysis.get('total_entries', 0):,}")
+            print(f"  Unique symbols: {heartbeat_analysis.get('unique_symbols', 0):,}")
+            print(f"  Duplicated symbols: {heartbeat_analysis.get('duplicated_symbols', 0):,}")
+            print(f"  Duplication rate: {heartbeat_analysis.get('dup_rate_pct', 0):.2f}%")
+            print(f"  Status: {heartbeat_analysis.get('status', 'UNKNOWN')}")
+
+        # Checkpoint summary
+        if checkpoint_analysis and "error" not in checkpoint_analysis:
+            print(f"\n💾 Checkpoint Progress:")
+            print(f"  Completed: {checkpoint_analysis.get('total_completed', 0):,} / {checkpoint_analysis.get('total_symbols', 0):,}")
+            print(f"  Progress: {checkpoint_analysis.get('progress_pct', 0):.1f}%")
+            print(f"  Remaining: {checkpoint_analysis.get('remaining', 0):,} symbols")
+
+        # Merged file summary
         if "merged_analysis" in results and results["merged_analysis"]:
             ma = results["merged_analysis"]
-            print(f"\nMerged File Analysis:")
+            print(f"\n📁 Merged File Analysis:")
             print(f"  File: {ma.get('file', 'N/A')}")
             print(f"  Total events: {ma.get('total_events', 0):,}")
             print(f"  Duplicates: {ma.get('duplicates', 0):,}")
             print(f"  Duplication rate: {ma.get('dup_rate_pct', 0):.2f}%")
             print(f"  Status: {ma.get('status', 'UNKNOWN')}")
 
-        print(f"\nCheckpoint vs Shards:")
-        print(f"  Checkpoint symbols: {comparison['checkpoint_symbols']}")
-        print(f"  Shard symbols: {comparison['shard_symbols']}")
-        print(f"  Discrepancy: {abs(comparison['checkpoint_symbols'] - comparison['shard_symbols'])}")
+        # Checkpoint vs shards
+        if comparison:
+            print(f"\n🔍 Checkpoint vs Shards:")
+            print(f"  Checkpoint symbols: {comparison.get('checkpoint_symbols', 0):,}")
+            print(f"  Shard symbols: {comparison.get('shard_symbols', 0):,}")
+            print(f"  Discrepancy: {abs(comparison.get('checkpoint_symbols', 0) - comparison.get('shard_symbols', 0)):,}")
 
         print(f"\n{'='*80}")
         print(f"ANALYSIS COMPLETE")
@@ -445,9 +663,20 @@ def main():
         help="Export shard analysis to CSV"
     )
     parser.add_argument(
+        "--heartbeat-only",
+        action="store_true",
+        help="Only analyze heartbeat log (fast check)"
+    )
+    parser.add_argument(
         "--merge-only",
         action="store_true",
         help="Only merge shards, don't analyze"
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=500,
+        help="Number of heartbeat lines to analyze (default: 500)"
     )
 
     args = parser.parse_args()
@@ -459,7 +688,8 @@ def main():
     else:
         analyzer.run_full_analysis(
             detailed=args.detailed,
-            export_csv=args.export_csv
+            export_csv=args.export_csv,
+            heartbeat_only=args.heartbeat_only
         )
 
 

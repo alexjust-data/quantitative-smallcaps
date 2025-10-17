@@ -147,18 +147,24 @@ def deduplicate_events(
         print("  OK Verification passed: No duplicates remain")
         print()
 
-    # Statistics
+    # Statistics (sin asumir 'date_et')
     stats = {
         "original_count": original_count,
         "deduplicated_count": deduplicated_count,
         "duplicates_removed": removed_count,
         "percentage_removed": removed_pct,
         "unique_symbols": df_dedup['symbol'].n_unique(),
-        "date_range": (
-            df_dedup['date_et'].min(),
-            df_dedup['date_et'].max()
-        )
     }
+
+    # Add date range info if available
+    if "date_et" in df_dedup.columns:
+        stats["date_start"] = str(df_dedup["date_et"].min())
+        stats["date_end"] = str(df_dedup["date_et"].max())
+    elif "timestamp" in df_dedup.columns:
+        stats["timestamp_start"] = str(df_dedup["timestamp"].min())
+        stats["timestamp_end"] = str(df_dedup["timestamp"].max())
+    else:
+        stats["range_info"] = "no date-like columns present"
 
     # Print summary
     print("="*80)
@@ -168,7 +174,15 @@ def deduplicate_events(
     print(f"Deduplicated events:  {stats['deduplicated_count']:>10,}")
     print(f"Duplicates removed:   {stats['duplicates_removed']:>10,} ({stats['percentage_removed']:.1f}%)")
     print(f"Unique symbols:       {stats['unique_symbols']:>10,}")
-    print(f"Date range:           {stats['date_range'][0]} to {stats['date_range'][1]}")
+
+    # Print date/timestamp range if available
+    if "date_start" in stats and "date_end" in stats:
+        print(f"Date range (ET):      {stats['date_start']} to {stats['date_end']}")
+    elif "timestamp_start" in stats and "timestamp_end" in stats:
+        print(f"Timestamp range:      {stats['timestamp_start']} to {stats['timestamp_end']}")
+    elif "range_info" in stats:
+        print(f"Range info:           {stats['range_info']}")
+
     print("="*80)
     print()
 
@@ -180,6 +194,17 @@ def deduplicate_events(
         print(f"  Size: {output_file.stat().st_size / 1024 / 1024:.1f} MB")
     else:
         print("DRY RUN: No file written")
+
+    import json, datetime, os
+    if not dry_run:
+        stats_file = os.path.splitext(output_file)[0] + ".stats.json"
+        stats["run_id"] = f"dedup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        stats["input_file"] = str(input_file)
+        stats["output_file"] = str(output_file)
+        stats["finished_at"] = datetime.datetime.now().isoformat()
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        print(f"\nStats written to: {stats_file}")
 
     return stats
 
