@@ -1,0 +1,209 @@
+*** a/scripts/ingestion/download_trades_quotes_intraday_v2.py
+--- b/scripts/ingestion/download_trades_quotes_intraday_v2.py
+@@
+-import requests
++import requests
++from requests.adapters import HTTPAdapter
++from urllib3.util.retry import Retry
+@@
+ class PolygonTradesQuotesDownloader:
+     def __init__(self, api_key: str, output_dir: Path, dry_run: bool = False, logger=None):
+         self.api_key = api_key
+         self.output_dir = output_dir
+         self.dry_run = dry_run
+         self.logger = logger or logging.getLogger(__name__)
+-        self.session = requests.Session() if not dry_run else None
++        # HTTP session con keep-alive y pool grande (reduce latencia por request)
++        self.session = requests.Session() if not dry_run else None
++        if self.session:
++            self.session.headers["Accept-Encoding"] = "gzip, deflate, br"
++            adapter = HTTPAdapter(
++                pool_connections=64,
++                pool_maxsize=64,
++                max_retries=Retry(total=3, backoff_factor=0.2)
++            )
++            self.session.mount("https://", adapter)
++            self.session.mount("http://", adapter)
++        # inyectado externamente en main()
++        self.rate_limiter = None
+@@
+-    def _make_request_with_retry(self, url: str, params: dict):
++    def _make_request_with_retry(self, url: str, params: dict):
++        # Respetar rate-limit global ANTES de cada request (incluye paginación next_url)
++        if getattr(self, "rate_limiter", None):
++            self.rate_limiter.wait()
+         resp = self.session.get(url, params=params, timeout=30)
+         if resp.status_code == 429:
+             raise RateLimitError("HTTP 429 Too Many Requests")
+         resp.raise_for_status()
+         return resp
+@@
+-    def download_event_window(self, symbol: str, event_id: str, timestamp_gte: int, timestamp_lte: int, *,
+-                              download_trades: bool = True, download_quotes: bool = True) -> dict:
++    def download_event_window(self, symbol: str, event_id: str, timestamp_gte: int, timestamp_lte: int, *,
++                              download_trades: bool = True, download_quotes: bool = True) -> dict:
+         """
+         Descarga trades/quotes para una ventana [gte,lte] y guarda en:
+         raw/market_data/event_windows/symbol=<SYM>/event=<EVENT_ID>/{trades,quotes}.parquet
+         """
+         logger = self.logger
+         event_dir = self.output_dir / f"symbol={symbol}" / f"event={event_id}"
+         trades_file = event_dir / "trades.parquet"
+         quotes_file = event_dir / "quotes.parquet"
+         stats = {"trades_count": 0, "quotes_count": 0, "size_mb": 0.0}
+-        # TRADES
+-        if download_trades and not self.dry_run:
+-            df_trades = self.download_trades(symbol, timestamp_gte, timestamp_lte)
+-            if df_trades is not None:
+-                event_dir.mkdir(parents=True, exist_ok=True)
+-                if len(df_trades) > 0 and safe_write_parquet(df_trades, trades_file):
+-                    stats["trades_count"] = len(df_trades)
+-                    try:
+-                        stats["size_mb"] += trades_file.stat().st_size / 1024 / 1024
+-                    except Exception:
+-                        pass
+-                    logger.info(f"{symbol} {event_id}: Saved {len(df_trades)} trades")
+-                else:
+-                    logger.info(f"{symbol} {event_id}: 0 trades (no file written)")
+-        # QUOTES
+-        if download_quotes and not self.dry_run:
+-            df_quotes = self.download_quotes(symbol, timestamp_gte, timestamp_lte)
+-            if df_quotes is not None:
+-                # NBBO by-change (downsample) si columnas presentes
+-                try:
+-                    nbbo_cols = [c for c in ["bid_price","ask_price","bid_size","ask_size"] if c in df_quotes.columns]
+-                    if len(nbbo_cols) >= 2 and len(df_quotes) > 0:
+-                        changes = None
+-                        for col in nbbo_cols:
+-                            cond = pl.col(col) != pl.col(col).shift(1)
+-                            changes = cond if changes is None else (changes | cond)
+-                        changes = changes.fill_null(True)
+-                        df_quotes = df_quotes.filter(changes)
+-                except Exception as e:
+-                    logger.warning(f"{symbol} {event_id}: NBBO by-change downsampling skipped: {e}")
+-                event_dir.mkdir(parents=True, exist_ok=True)
+-                if len(df_quotes) > 0 and safe_write_parquet(df_quotes, quotes_file):
+-                    stats["quotes_count"] = len(df_quotes)
+-                    try:
+-                        stats["size_mb"] += quotes_file.stat().st_size / 1024 / 1024
+-                    except Exception:
+-                        pass
+-                    logger.info(f"{symbol} {event_id}: Saved {len(df_quotes)} quotes")
+-                else:
+-                    logger.info(f"{symbol} {event_id}: 0 quotes (no file written)")
++        # Ejecutar TRADES y QUOTES en paralelo para solapar latencia
++        from concurrent.futures import ThreadPoolExecutor
++
++        def _do_trades():
++            local = {"count": 0, "size": 0.0}
++            if not download_trades or self.dry_run:
++                return local
++            df_trades = self.download_trades(symbol, timestamp_gte, timestamp_lte)
++            if df_trades is not None:
++                event_dir.mkdir(parents=True, exist_ok=True)
++                if len(df_trades) > 0 and safe_write_parquet(df_trades, trades_file):
++                    local["count"] = len(df_trades)
++                    try:
++                        local["size"] += trades_file.stat().st_size / 1024 / 1024
++                    except Exception:
++                        pass
++                    logger.info(f"{symbol} {event_id}: Saved {len(df_trades)} trades")
++                else:
++                    logger.info(f"{symbol} {event_id}: 0 trades (no file written)")
++            return local
++
++        def _do_quotes():
++            local = {"count": 0, "size": 0.0}
++            if not download_quotes or self.dry_run:
++                return local
++            df_quotes = self.download_quotes(symbol, timestamp_gte, timestamp_lte)
++            if df_quotes is not None:
++                # NBBO by-change (downsample) si columnas presentes
++                try:
++                    nbbo_cols = [c for c in ["bid_price","ask_price","bid_size","ask_size"] if c in df_quotes.columns]
++                    if len(nbbo_cols) >= 2 and len(df_quotes) > 0:
++                        changes = None
++                        for col in nbbo_cols:
++                            cond = pl.col(col) != pl.col(col).shift(1)
++                            changes = cond if changes is None else (changes | cond)
++                        changes = changes.fill_null(True)
++                        df_quotes = df_quotes.filter(changes)
++                except Exception as e:
++                    logger.warning(f"{symbol} {event_id}: NBBO by-change downsampling skipped: {e}")
++                event_dir.mkdir(parents=True, exist_ok=True)
++                if len(df_quotes) > 0 and safe_write_parquet(df_quotes, quotes_file):
++                    local["count"] = len(df_quotes)
++                    try:
++                        local["size"] += quotes_file.stat().st_size / 1024 / 1024
++                    except Exception:
++                        pass
++                    logger.info(f"{symbol} {event_id}: Saved {len(df_quotes)} quotes")
++                else:
++                    logger.info(f"{symbol} {event_id}: 0 quotes (no file written)")
++            return local
++
++        tr = qt = {"count": 0, "size": 0.0}
++        with ThreadPoolExecutor(max_workers=2) as ex:
++            ftr = ex.submit(_do_trades)
++            fqt = ex.submit(_do_quotes)
++            tr = ftr.result()
++            qt = fqt.result()
++        stats["trades_count"] = tr["count"]
++        stats["quotes_count"] = qt["count"]
++        stats["size_mb"] += tr["size"] + qt["size"]
+         return stats
+@@
+ def main():
+     args = parse_args()
+     # ...
+-    rate_limiter = RateLimiter(args.rate_limit)
++    rate_limiter = RateLimiter(args.rate_limit)
+     downloader = PolygonTradesQuotesDownloader(
+         api_key=args.api_key,
+         output_dir=Path(args.output_dir),
+         dry_run=args.dry_run,
+         logger=logger,
+     )
++    # Inyectar rate limiter global en el downloader para que gobierne CADA request
++    downloader.rate_limiter = rate_limiter
+@@
+-    # Construir lista de eventos desde manifest (df_manifest)
++    # Construir lista de eventos desde manifest (df_manifest)
++    # -------- Prefiltro: saltar eventos ya completos (trades+quotes) ----------
++    existing = set()
++    ev_root = Path(args.output_dir)
++    if ev_root.exists():
++        for ev_dir in ev_root.rglob("event=*"):
++            try:
++                t_ok = (ev_dir / "trades.parquet").exists()
++                q_ok = (ev_dir / "quotes.parquet").exists()
++                if t_ok and q_ok:
++                    existing.add(ev_dir.name.split("event=")[1])
++            except Exception:
++                pass
++    def _canonical_id(row):
++        # Usa la misma función que el guardado (UTC + hash corto) si existe.
++        # Fallback compatible: SYMBOL_type_YYYYMMDD_HHMMSS (evita misses en resume)
++        try:
++            return generate_canonical_event_id(row)  # ya presente en tu código
++        except NameError:
++            from datetime import datetime, timezone
++            ts = row["timestamp"]
++            if isinstance(ts, (int, float)):
++                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
++            else:
++                # por si viene ya como datetime
++                dt = ts.astimezone(timezone.utc)
++            return f"{row['symbol']}_{row['event_type']}_{dt:%Y%m%d_%H%M%S}"
++
++    filtered_rows = []
++    skipped_pre = 0
++    for row in df_manifest.iter_rows(named=True):
++        eid = _canonical_id(row)
++        if eid in existing:
++            skipped_pre += 1
++            continue
++        filtered_rows.append(row)
++    if skipped_pre:
++        logger.info(f"Prefilter: {skipped_pre} events already complete on disk → skipped")
++    df_manifest = pl.DataFrame(filtered_rows) if filtered_rows else df_manifest.head(0)

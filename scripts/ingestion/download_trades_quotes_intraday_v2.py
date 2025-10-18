@@ -50,6 +50,8 @@ import polars as pl
 import yaml
 from loguru import logger
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -359,10 +361,21 @@ class PolygonTradesQuotesDownloader:
         self.ny_tz = ZoneInfo("America/New_York")
         self.utc_tz = ZoneInfo("UTC")
 
-        # HTTP session with gzip compression
+        # HTTP session with gzip compression + keep-alive pool
         self.session = requests.Session() if not dry_run else None
         if self.session:
             self.session.headers["Accept-Encoding"] = "gzip, deflate, br"
+            # HTTP adapter with connection pooling (reduces latency)
+            adapter = HTTPAdapter(
+                pool_connections=64,
+                pool_maxsize=64,
+                max_retries=Retry(total=3, backoff_factor=0.2)
+            )
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+
+        # Rate limiter injected externally from main()
+        self.rate_limiter = None
 
         logger.info("Initialized PolygonTradesQuotesDownloader (FASE 3.2)")
         logger.info(f"  Window: [-{self.window_before_minutes}min, +{self.window_after_minutes}min]")
@@ -389,6 +402,10 @@ class PolygonTradesQuotesDownloader:
 
         for attempt in range(self.retry_max_attempts):
             try:
+                # Apply rate-limit BEFORE each request (includes pagination)
+                if self.rate_limiter:
+                    self.rate_limiter.wait()
+
                 response = self.session.get(url, params=params, timeout=30)
 
                 if response.status_code == 200:
@@ -713,80 +730,76 @@ class PolygonTradesQuotesDownloader:
         timestamp_gte = self._ensure_utc_timestamp_ns(window_start)
         timestamp_lte = self._ensure_utc_timestamp_ns(window_end)
 
-        # Download trades
-        if download_trades:
+        # --- OPTIMIZATION: Parallel trades + quotes download to overlap latency ---
+        def _do_trades():
+            """Download trades in parallel"""
+            local = {"count": 0, "size": 0.0}
+            if not download_trades or self.dry_run:
+                return local
+
             df_trades = self.download_trades(symbol, timestamp_gte, timestamp_lte)
-
-            if df_trades is not None and not self.dry_run:
+            if df_trades is not None:
                 event_dir.mkdir(parents=True, exist_ok=True)
-
-                # --- PATCH 5: Atomic writes with anti-WinError retry ---
                 if len(df_trades) > 0:
                     success = safe_write_parquet(df_trades, trades_file)
                     if success:
-                        stats["trades_count"] = len(df_trades)
+                        local["count"] = len(df_trades)
                         if trades_file.exists():
-                            stats["size_mb"] += trades_file.stat().st_size / 1024 / 1024
+                            local["size"] += trades_file.stat().st_size / 1024 / 1024
                         logger.info(f"{symbol} {event_id}: Saved {len(df_trades)} trades")
                     else:
                         logger.warning(f"{symbol} {event_id}: Failed to finalize trades file (will retry on resume)")
                 else:
                     logger.info(f"{symbol} {event_id}: 0 trades (no file written)")
+            return local
 
-            if not self.dry_run:
-                if rate_limiter:
-                    rate_limiter.wait()
-                else:
-                    time.sleep(self.rate_limit_delay)
+        def _do_quotes():
+            """Download quotes in parallel"""
+            local = {"count": 0, "size": 0.0}
+            if not download_quotes or self.dry_run:
+                return local
 
-        # Download quotes
-        if download_quotes:
             df_quotes = self.download_quotes(symbol, timestamp_gte, timestamp_lte)
-
-            if df_quotes is not None and not self.dry_run:
-                # --- PATCH 6: NBBO by-change-only downsampling ---
+            if df_quotes is not None:
+                # NBBO by-change-only downsampling
                 try:
                     nbbo_cols = [c for c in ["bid_price", "ask_price", "bid_size", "ask_size"]
                                 if c in df_quotes.columns]
-
                     if len(nbbo_cols) >= 2 and len(df_quotes) > 0:
-                        # Mark rows where any NBBO field changes from previous row
                         changes = None
                         for col in nbbo_cols:
                             cond = pl.col(col) != pl.col(col).shift(1)
                             changes = cond if changes is None else (changes | cond)
-
-                        # Keep first row always
                         changes = changes.fill_null(True)
-                        df_quotes_filtered = df_quotes.filter(changes)
-
-                        if len(df_quotes_filtered) < len(df_quotes):
-                            logger.debug(f"{symbol} {event_id}: NBBO by-change: {len(df_quotes)} → {len(df_quotes_filtered)} quotes")
-                            df_quotes = df_quotes_filtered
-
+                        df_quotes = df_quotes.filter(changes)
                 except Exception as e:
                     logger.warning(f"{symbol} {event_id}: NBBO by-change downsampling skipped: {e}")
 
                 event_dir.mkdir(parents=True, exist_ok=True)
-
-                # --- PATCH 5: Atomic writes with anti-WinError retry ---
                 if len(df_quotes) > 0:
                     success = safe_write_parquet(df_quotes, quotes_file)
                     if success:
-                        stats["quotes_count"] = len(df_quotes)
+                        local["count"] = len(df_quotes)
                         if quotes_file.exists():
-                            stats["size_mb"] += quotes_file.stat().st_size / 1024 / 1024
+                            local["size"] += quotes_file.stat().st_size / 1024 / 1024
                         logger.info(f"{symbol} {event_id}: Saved {len(df_quotes)} quotes")
                     else:
                         logger.warning(f"{symbol} {event_id}: Failed to finalize quotes file (will retry on resume)")
                 else:
                     logger.info(f"{symbol} {event_id}: 0 quotes (no file written)")
+            return local
 
-            if not self.dry_run:
-                if rate_limiter:
-                    rate_limiter.wait()
-                else:
-                    time.sleep(self.rate_limit_delay)
+        # Execute trades and quotes in parallel (rate-limit applied per request)
+        tr = qt = {"count": 0, "size": 0.0}
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            ftr = ex.submit(_do_trades)
+            fqt = ex.submit(_do_quotes)
+            tr = ftr.result()
+            qt = fqt.result()
+
+        stats["trades_count"] = tr["count"]
+        stats["quotes_count"] = qt["count"]
+        stats["size_mb"] += tr["size"] + qt["size"]
 
         # Budget cut logic
         if budget_mb and stats["size_mb"] > budget_mb:
@@ -901,6 +914,34 @@ def main():
 
     logger.info(f"Output directory: {output_dir}")
 
+    # --- OPTIMIZATION: Prefilter already-completed events (trades+quotes both exist) ---
+    logger.info("Scanning disk for already-completed events...")
+    existing = set()
+    if output_dir.exists():
+        for ev_dir in output_dir.rglob("event=*"):
+            try:
+                trades_ok = (ev_dir / "trades.parquet").exists()
+                quotes_ok = (ev_dir / "quotes.parquet").exists()
+                if trades_ok and quotes_ok:
+                    # Extract event_id from directory name "event=SYMBOL_type_DATE_hash"
+                    existing.add(ev_dir.name.split("event=")[1])
+            except Exception:
+                pass
+
+    # Filter manifest to exclude already-completed events
+    skipped_pre = 0
+    filtered_rows = []
+    for row in df_manifest.iter_rows(named=True):
+        event_id = generate_canonical_event_id(row)
+        if event_id in existing:
+            skipped_pre += 1
+            continue
+        filtered_rows.append(row)
+
+    if skipped_pre > 0:
+        logger.info(f"Prefilter: {skipped_pre:,} events already complete on disk → skipped")
+        df_manifest = pl.DataFrame(filtered_rows) if filtered_rows else df_manifest.head(0)
+
     # Checkpoint
     checkpoint_file = PROJECT_ROOT / "logs" / "checkpoints" / f"fase3.2_{args.wave}_progress.json"
     checkpoint = CheckpointManager(checkpoint_file) if args.resume else None
@@ -927,6 +968,9 @@ def main():
 
     # Global rate limiter (shared across workers)
     rate_limiter = RateLimiter(args.rate_limit)
+
+    # Inject rate limiter into downloader (applies to EVERY API request, including pagination)
+    downloader.rate_limiter = rate_limiter
 
     # Worker function for parallel execution
     def process_event(event_tuple):
